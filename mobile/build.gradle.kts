@@ -8,17 +8,14 @@ import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.PathSensitive
 import org.gradle.api.tasks.PathSensitivity
 import org.gradle.api.tasks.TaskAction
-import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.crashlytics)
     alias(libs.plugins.ksp)
     alias(libs.plugins.google.services)
-    alias(libs.plugins.kotlin.android)
+    alias(libs.plugins.kotlin.parcelize)
     id("com.google.android.gms.oss-licenses-plugin")
-    kotlin("kapt")
-    id("kotlin-parcelize")
 }
 
 abstract class GenerateGitJavaTask : DefaultTask() {
@@ -80,6 +77,11 @@ abstract class BuildDaemonNativeLibsTask : DefaultTask() {
             mkdirs()
         }
         val profile = cargoProfile.get()
+        val rustFlags = listOf(
+            "--remap-path-prefix=${System.getProperty("user.home").trimEnd('/')}/=",
+            "--remap-path-prefix=${cargoDir.absolutePath}=.",
+            "--remap-path-prefix=${cargoDir.absolutePath}/=",
+        ).joinToString("\u001F")
         val targets = listOf(
             "arm64-v8a" to "aarch64-linux-android",
             "armeabi-v7a" to "armv7-linux-androideabi",
@@ -92,7 +94,10 @@ abstract class BuildDaemonNativeLibsTask : DefaultTask() {
                 if (profile == "release") add("--release")
             }
             val process = ProcessBuilder(command).directory(cargoDir).redirectErrorStream(true).apply {
-                environment()["CARGO_BUILD_TARGET_DIR"] = targetDir.absolutePath
+                environment().run {
+                    this["CARGO_BUILD_TARGET_DIR"] = targetDir.absolutePath
+                    this["CARGO_ENCODED_RUSTFLAGS"] = rustFlags
+                }
             }.start()
             val output = process.inputStream.bufferedReader().readText()
             check(process.waitFor() == 0) {
@@ -116,9 +121,6 @@ android {
         isCoreLibraryDesugaringEnabled = true
         sourceCompatibility(javaVersion)
         targetCompatibility(javaVersion)
-    }
-    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile> {
-        compilerOptions.jvmTarget.set(JvmTarget.fromTarget(javaVersion.toString()))
     }
     compileSdk = 36
     compileSdkMinor = 1
@@ -177,7 +179,6 @@ ksp {
     arg("room.incremental", "true")
     arg("room.schemaLocation", "$projectDir/schemas")
 }
-kotlin.compilerOptions.jvmTarget.set(JvmTarget.fromTarget(javaVersion.toString()))
 
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs)
@@ -201,7 +202,6 @@ dependencies {
     implementation(libs.preference)
     implementation(libs.preferencex.simplemenu)
     implementation(libs.room.ktx)
-    implementation(libs.swiperefreshlayout)
     implementation(libs.timber)
     implementation(libs.zxing.core)
     testImplementation(libs.junit)

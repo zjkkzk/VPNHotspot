@@ -5,7 +5,11 @@ use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use vpnhotspotd::shared::model::{ipv6_to_u128, Ipv6NatPorts, Route, SessionConfig};
+use cidr::Ipv6Inet;
+
+use crate::netlink;
+use crate::report;
+use vpnhotspotd::shared::model::{Ipv6NatPorts, SessionConfig};
 
 mod ra;
 mod tcp;
@@ -14,7 +18,8 @@ mod udp;
 
 pub(crate) struct Runtime {
     pub(crate) ports: Ipv6NatPorts,
-    cleanup_prefixes: Vec<Route>,
+    cleanup_prefixes: Vec<Ipv6Inet>,
+    netlink: netlink::Handle,
     config_changed: Arc<Notify>,
     ra_task: JoinHandle<()>,
 }
@@ -24,10 +29,12 @@ impl Runtime {
         config: &SessionConfig,
         shared: Arc<Mutex<SessionConfig>>,
         stop: CancellationToken,
+        netlink: netlink::Handle,
+        ipv6_address_changed: Arc<Notify>,
     ) -> io::Result<Option<Self>> {
-        let Some(ipv6_nat) = config.ipv6_nat.as_ref() else {
+        if config.ipv6_nat.is_none() {
             return Ok(None);
-        };
+        }
         let config_changed = Arc::new(Notify::new());
         let tcp_listener = tproxy::create_tcp_listener(config.reply_mark)?;
         let tcp = tcp_listener.local_addr()?.port();
@@ -38,7 +45,14 @@ impl Runtime {
             stop.cancel();
             return Err(e);
         }
-        let ra_task = match ra::spawn_loop(shared, config_changed.clone(), stop.clone(), config) {
+        let ra_task = match ra::spawn_loop(
+            shared,
+            config_changed.clone(),
+            ipv6_address_changed,
+            netlink.clone(),
+            stop.clone(),
+            config,
+        ) {
             Ok(task) => task,
             Err(e) => {
                 stop.cancel();
@@ -47,7 +61,8 @@ impl Runtime {
         };
         Ok(Some(Self {
             ports: Ipv6NatPorts { tcp, udp },
-            cleanup_prefixes: ipv6_nat.cleanup_prefixes.clone(),
+            cleanup_prefixes: Vec::new(),
+            netlink,
             config_changed,
             ra_task,
         }))
@@ -61,20 +76,11 @@ impl Runtime {
         let Some(next) = next.ipv6_nat.as_ref() else {
             return;
         };
-        for prefix in next.cleanup_prefixes.iter().copied() {
-            if !self.cleanup_prefixes.contains(&prefix) {
-                self.cleanup_prefixes.push(prefix);
-            }
-        }
         if let Some(previous) = previous.ipv6_nat.as_ref() {
-            if previous.gateway != next.gateway || previous.prefix_len != next.prefix_len {
-                let previous_prefix = Route {
-                    prefix: ipv6_to_u128(previous.gateway),
-                    prefix_len: previous.prefix_len,
-                };
-                if !self.cleanup_prefixes.contains(&previous_prefix) {
-                    self.cleanup_prefixes.push(previous_prefix);
-                }
+            if previous.gateway != next.gateway
+                && !self.cleanup_prefixes.contains(&previous.gateway)
+            {
+                self.cleanup_prefixes.push(previous.gateway);
             }
         }
     }
@@ -85,7 +91,7 @@ impl Runtime {
 
     pub(crate) async fn stop(self, snapshot: &SessionConfig, withdraw_cleanup: bool) {
         if let Err(e) = self.ra_task.await {
-            eprintln!("ra task join failed: {e}");
+            report::message("nat66.ra_task_join", e.to_string(), "JoinError");
         }
         let Some(ipv6_nat) = snapshot.ipv6_nat.as_ref() else {
             return;
@@ -95,10 +101,7 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        prefixes.push(Route {
-            prefix: ipv6_to_u128(ipv6_nat.gateway),
-            prefix_len: ipv6_nat.prefix_len,
-        });
-        ra::withdraw_prefixes_once(snapshot, &prefixes, false).await;
+        prefixes.push(ipv6_nat.gateway);
+        ra::withdraw_prefixes_once(&self.netlink, snapshot, &prefixes, false).await;
     }
 }
