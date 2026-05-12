@@ -7,8 +7,14 @@ import be.mygod.vpnhotspot.net.Routing
 import be.mygod.vpnhotspot.net.Routing.Ipv6Mode
 import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.wifi.WifiDoubleLock
+import be.mygod.vpnhotspot.root.daemon.MasqueradeMode
 import be.mygod.vpnhotspot.widget.SmartSnackbar
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
@@ -17,14 +23,31 @@ abstract class RoutingManager(private val caller: Any, val downstream: String, p
     companion object {
         private const val KEY_MASQUERADE_MODE = "service.masqueradeMode"
         private const val KEY_IPV6_MODE = "service.ipv6Mode"
-        var masqueradeMode: Routing.MasqueradeMode
+        var masqueradeMode: MasqueradeMode
             get() = app.pref.run {
-                getString(KEY_MASQUERADE_MODE, null)?.let { return@run Routing.MasqueradeMode.valueOf(it) }
+                getString(KEY_MASQUERADE_MODE, null)?.let {
+                    return@run when (it) {
+                        "None" -> MasqueradeMode.MASQUERADE_MODE_NONE
+                        "Simple" -> MasqueradeMode.MASQUERADE_MODE_SIMPLE
+                        "Netd" -> MasqueradeMode.MASQUERADE_MODE_NETD
+                        "MASQUERADE_MODE_NONE" -> MasqueradeMode.MASQUERADE_MODE_NONE
+                        "MASQUERADE_MODE_SIMPLE" -> MasqueradeMode.MASQUERADE_MODE_SIMPLE
+                        "MASQUERADE_MODE_NETD" -> MasqueradeMode.MASQUERADE_MODE_NETD
+                        else -> throw IllegalArgumentException("Invalid masquerade mode $it")
+                    }
+                }
                 if (getBoolean("service.masquerade", true)) {   // legacy settings
-                    Routing.MasqueradeMode.Simple
-                } else Routing.MasqueradeMode.None
+                    MasqueradeMode.MASQUERADE_MODE_SIMPLE
+                } else MasqueradeMode.MASQUERADE_MODE_NONE
             }
-            set(value) = app.pref.edit { putString(KEY_MASQUERADE_MODE, value.name) }
+            set(value) = app.pref.edit {
+                putString(KEY_MASQUERADE_MODE, when (value) {
+                    MasqueradeMode.MASQUERADE_MODE_NONE -> "None"
+                    MasqueradeMode.MASQUERADE_MODE_SIMPLE -> "Simple"
+                    MasqueradeMode.MASQUERADE_MODE_NETD -> "Netd"
+                    is MasqueradeMode.Unrecognized -> throw IllegalArgumentException("Invalid masquerade mode")
+                })
+            }
         var ipv6Mode: Ipv6Mode
             get() = app.pref.run {
                 getString(KEY_IPV6_MODE, null)?.let { return@run Ipv6Mode.valueOf(it) }
@@ -107,6 +130,7 @@ abstract class RoutingManager(private val caller: Any, val downstream: String, p
      */
     private var routing: Routing? = null
     private var isWifi = forceWifi || TetherType.ofInterface(downstream).isWifi
+    private var tetherTypeJob: Job? = null
 
     suspend fun start(): Boolean {
         while (true) {
@@ -144,16 +168,27 @@ abstract class RoutingManager(private val caller: Any, val downstream: String, p
 
     private fun acquireLocked() {
         if (isWifi) WifiDoubleLock.acquire(this)
-        if (!forceWifi && Build.VERSION.SDK_INT >= 30) TetherType.listener[this] = {
-            val isWifiNow = TetherType.ofInterface(downstream).isWifi
-            if (isWifi != isWifiNow) {
-                if (isWifi) WifiDoubleLock.release(this) else WifiDoubleLock.acquire(this)
-                isWifi = isWifiNow
+        if (!forceWifi && Build.VERSION.SDK_INT >= 30) {
+            tetherTypeJob = CoroutineScope(Dispatchers.Default).launch(start = CoroutineStart.UNDISPATCHED) {
+                TetherType.changes.collect {
+                    monitor.withLock {
+                        if (active[downstream] !== this@RoutingManager || !started) return@withLock
+                        val isWifiNow = TetherType.ofInterface(downstream).isWifi
+                        if (isWifi != isWifiNow) {
+                            if (isWifi) WifiDoubleLock.release(this@RoutingManager)
+                            else WifiDoubleLock.acquire(this@RoutingManager)
+                            isWifi = isWifiNow
+                        }
+                    }
+                }
             }
         }
     }
     private fun releaseLocked() {
-        if (!forceWifi && Build.VERSION.SDK_INT >= 30) TetherType.listener -= this
+        if (!forceWifi && Build.VERSION.SDK_INT >= 30) {
+            tetherTypeJob?.cancel()
+            tetherTypeJob = null
+        }
         if (isWifi) WifiDoubleLock.release(this)
     }
 

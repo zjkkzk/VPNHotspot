@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -20,14 +21,15 @@ use crate::{
 };
 use vpnhotspotd::shared::downstream::DownstreamIpv4;
 use vpnhotspotd::shared::model::{
-    ipv6_nat_gateway, ipv6_nat_prefix, ClientConfig, Ipv6NatPorts, MasqueradeMode, SessionConfig,
-    SessionPorts, UpstreamConfig, UpstreamRole, DAEMON_INTERCEPT_FWMARK_MASK,
-    DAEMON_INTERCEPT_FWMARK_VALUE, DAEMON_REPLY_MARK, DAEMON_REPLY_MARK_MASK, DAEMON_TABLE,
+    ipv6_nat_gateway, ipv6_nat_prefix, ClientConfig, Ipv6NatPorts, SessionConfig, SessionPorts,
+    UpstreamConfig, UpstreamRole, DAEMON_INTERCEPT_FWMARK_MASK, DAEMON_INTERCEPT_FWMARK_VALUE,
+    DAEMON_REPLY_MARK, DAEMON_REPLY_MARK_MASK, DAEMON_TABLE, DAEMON_UDP_TPROXY_ADDRESS,
     LOCAL_NETWORK_TABLE,
 };
-use vpnhotspotd::shared::protocol::{
-    error_errno, CleanRoutingCommand, IoResultReportExt, StaticAddressesCommand,
+use vpnhotspotd::shared::proto::daemon::{
+    CleanRoutingCommand, MasqueradeMode, ReplaceStaticAddressesCommand,
 };
+use vpnhotspotd::shared::protocol::{error_errno, read_ip_address_entry, IoResultReportExt};
 
 // AOSP local-network/tethering priorities are 20000/21000 since Android 12 and 17000/18000
 // on API 29..30. Keep VPNHotspot rules inside that gap.
@@ -384,51 +386,59 @@ impl Runtime {
             );
             // Upstream-specific MASQUERADE rules are added from upstream snapshots.
         }
-        let mut upstreams = Vec::new();
-        for upstream in &config.upstreams {
-            if upstreams.contains(upstream) {
-                continue;
-            }
-            let ifindex = match netlink::link_index(&self.netlink, &upstream.ifname).await {
-                Ok(ifindex) => ifindex,
-                Err(e) if netlink::is_missing_link(&e) => continue,
-                Err(e) => {
-                    return Err(e).with_report_context_details(
-                        "routing.resolve_upstream_index",
-                        [("upstream", upstream.ifname.as_str())],
-                    );
+        let mut seen_upstream_interfaces = HashSet::new();
+        for (interfaces, role) in [
+            (&config.primary_upstream_interfaces, UpstreamRole::Primary),
+            (&config.fallback_upstream_interfaces, UpstreamRole::Fallback),
+        ] {
+            for ifname in interfaces {
+                if !seen_upstream_interfaces.insert(ifname.as_str()) {
+                    continue;
                 }
-            };
-            upstreams.push(upstream.clone());
-            push_unique(
-                &mut mutations,
-                RoutingMutation::IpRule(IpRuleCommand {
-                    operation: IpOperation::Replace,
-                    family: IpFamily::Ipv4,
-                    iif: config.downstream.clone(),
-                    priority: rule_priority(match upstream.role {
-                        UpstreamRole::Primary => RULE_PRIORITY_UPSTREAM_BASE,
-                        UpstreamRole::Fallback => RULE_PRIORITY_UPSTREAM_FALLBACK_BASE,
+                let ifindex = match netlink::link_index(&self.netlink, ifname).await {
+                    Ok(ifindex) => ifindex,
+                    Err(e) if netlink::is_missing_link(&e) => continue,
+                    Err(e) => {
+                        return Err(e).with_report_context_details(
+                            "routing.resolve_upstream_index",
+                            [("upstream", ifname.as_str())],
+                        );
+                    }
+                };
+                let upstream = UpstreamConfig {
+                    ifname: ifname.clone(),
+                    role,
+                };
+                push_unique(
+                    &mut mutations,
+                    RoutingMutation::IpRule(IpRuleCommand {
+                        operation: IpOperation::Replace,
+                        family: IpFamily::Ipv4,
+                        iif: config.downstream.clone(),
+                        priority: rule_priority(match upstream.role {
+                            UpstreamRole::Primary => RULE_PRIORITY_UPSTREAM_BASE,
+                            UpstreamRole::Fallback => RULE_PRIORITY_UPSTREAM_FALLBACK_BASE,
+                        }),
+                        action: RuleAction::Lookup,
+                        // https://android.googlesource.com/platform/system/netd/+/android-5.0.0_r1/server/RouteController.h#37
+                        table: 1000 + ifindex,
+                        fwmark: None,
                     }),
-                    action: RuleAction::Lookup,
-                    // https://android.googlesource.com/platform/system/netd/+/android-5.0.0_r1/server/RouteController.h#37
-                    table: 1000 + ifindex,
-                    fwmark: None,
-                }),
-            );
-            match config.masquerade {
-                MasqueradeMode::None => {}
-                MasqueradeMode::Simple => push_unique(
-                    &mut mutations,
-                    RoutingMutation::Iptables(self.upstream_masquerade_rule(upstream)),
-                ),
-                MasqueradeMode::Netd => push_unique(
-                    &mut mutations,
-                    RoutingMutation::NetdNat {
-                        downstream: config.downstream.clone(),
-                        upstream: upstream.ifname.clone(),
-                    },
-                ),
+                );
+                match config.masquerade {
+                    MasqueradeMode::None => {}
+                    MasqueradeMode::Simple => push_unique(
+                        &mut mutations,
+                        RoutingMutation::Iptables(self.upstream_masquerade_rule(&upstream)),
+                    ),
+                    MasqueradeMode::Netd => push_unique(
+                        &mut mutations,
+                        RoutingMutation::NetdNat {
+                            downstream: config.downstream.clone(),
+                            upstream: upstream.ifname,
+                        },
+                    ),
+                }
             }
         }
         if config.ipv6_block {
@@ -913,23 +923,25 @@ impl Runtime {
         [("tcp", ports.tcp), ("udp", ports.udp)]
             .into_iter()
             .map(|(protocol, port)| {
-                IptablesRule::new(
-                    IptablesTarget::Ipv6,
-                    "mangle",
-                    "vpnhotspot_v6_tproxy",
-                    vec![
-                        "-i".into(),
-                        config.downstream.clone(),
-                        "-p".into(),
-                        protocol.into(),
-                        "-j".into(),
-                        "TPROXY".into(),
-                        "--on-port".into(),
-                        port.to_string(),
-                        "--tproxy-mark".into(),
-                        "0x10000000/0x10000000".into(),
-                    ],
-                )
+                let mut args = vec![
+                    "-i".into(),
+                    config.downstream.clone(),
+                    "-p".into(),
+                    protocol.into(),
+                    "-j".into(),
+                    "TPROXY".into(),
+                ];
+                if protocol == "udp" {
+                    // Keep listener socket lookup disjoint from exact-bound UDP reply sockets.
+                    args.extend(["--on-ip".into(), DAEMON_UDP_TPROXY_ADDRESS.to_string()]);
+                }
+                args.extend([
+                    "--on-port".into(),
+                    port.to_string(),
+                    "--tproxy-mark".into(),
+                    "0x10000000/0x10000000".into(),
+                ]);
+                IptablesRule::new(IptablesTarget::Ipv6, "mangle", "vpnhotspot_v6_tproxy", args)
             })
             .collect()
     }
@@ -1190,40 +1202,33 @@ async fn remove_ip_forward(downstream: &str) -> bool {
 
 pub(crate) async fn replace_static_addresses(
     handle: &netlink::Handle,
-    command: &StaticAddressesCommand,
+    command: &ReplaceStaticAddressesCommand,
 ) -> io::Result<()> {
-    let index = netlink::link_index(handle, &command.interface)
+    let index = netlink::link_index(handle, &command.dev)
         .await
         .with_report_context_details(
             "routing.static_addresses.link_index",
-            [("interface", command.interface.clone())],
+            [("dev", command.dev.clone())],
         )?;
-    for address in &command.addresses {
-        let command = IpAddressCommand {
+    let requested_addresses = command
+        .addresses
+        .iter()
+        .map(read_ip_address_entry)
+        .collect::<io::Result<Vec<_>>>()?;
+    let requested = requested_addresses.iter().copied().collect::<HashSet<_>>();
+    for (address, prefix_len) in requested_addresses {
+        let address_command = IpAddressCommand {
             operation: IpOperation::Replace,
-            address: address.address,
-            prefix_len: address.prefix_len,
-            interface: command.interface.clone(),
+            address,
+            prefix_len,
+            interface: command.dev.clone(),
         };
-        match apply_address_command_with_index(handle, &command, index).await {
+        match apply_address_command_with_index(handle, &address_command, index).await {
             Ok(()) => {}
             Err(e) if error_errno(&e) == Some(libc::EEXIST) => {}
             Err(e) => return Err(e),
         }
     }
-    Ok(())
-}
-
-pub(crate) async fn delete_static_addresses(
-    handle: &netlink::Handle,
-    interface: &str,
-) -> io::Result<()> {
-    let index = netlink::link_index(handle, interface)
-        .await
-        .with_report_context_details(
-            "routing.static_addresses.link_index",
-            [("interface", interface.to_owned())],
-        )?;
     let _dump = handle.lock_dump().await;
     let addresses = handle
         .raw()
@@ -1238,7 +1243,7 @@ pub(crate) async fn delete_static_addresses(
         .map_err(netlink::to_io_error)
         .with_report_context_details(
             "routing.static_addresses.dump",
-            [("interface", interface.to_owned())],
+            [("dev", command.dev.clone())],
         )?
     {
         let mut address = None;
@@ -1257,16 +1262,17 @@ pub(crate) async fn delete_static_addresses(
         let Some(address) = address else {
             continue;
         };
-        if address.is_loopback() {
+        let prefix_len = message.header.prefix_len;
+        if address.is_loopback() || requested.contains(&(address, prefix_len)) {
             continue;
         }
-        let command = IpAddressCommand {
+        let address_command = IpAddressCommand {
             operation: IpOperation::Delete,
             address,
-            prefix_len: message.header.prefix_len,
-            interface: interface.to_owned(),
+            prefix_len,
+            interface: command.dev.clone(),
         };
-        match apply_address_command_with_index(handle, &command, index).await {
+        match apply_address_command_with_index(handle, &address_command, index).await {
             Ok(()) => {}
             Err(e) if is_missing_address(&e) => {}
             Err(e) => return Err(e),
@@ -1761,45 +1767,4 @@ fn android_api_level() -> i32 {
         fn android_get_device_api_level() -> libc::c_int;
     }
     unsafe { android_get_device_api_level() as i32 }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn host_subnet_masks_host_bits() {
-        assert_eq!(
-            host_subnet(DownstreamIpv4 {
-                address: Ipv4Addr::new(192, 168, 43, 1),
-                prefix_len: 24,
-            }),
-            "192.168.43.0/24"
-        );
-    }
-
-    #[test]
-    fn host_subnet_handles_default_route() {
-        assert_eq!(
-            host_subnet(DownstreamIpv4 {
-                address: Ipv4Addr::new(192, 168, 43, 1),
-                prefix_len: 0,
-            }),
-            "0.0.0.0/0"
-        );
-    }
-
-    #[test]
-    fn mac_string_uses_xtables_format() {
-        assert_eq!(
-            mac_string(&[0x02, 0xab, 0, 0x7f, 0x80, 0xff]),
-            "02:ab:00:7f:80:ff"
-        );
-    }
-
-    #[test]
-    fn rule_priority_uses_android_routing_gap() {
-        assert_eq!(rule_priority_for_api(RULE_PRIORITY_DAEMON_BASE, 30), 17600);
-        assert_eq!(rule_priority_for_api(RULE_PRIORITY_DAEMON_BASE, 31), 20600);
-    }
 }

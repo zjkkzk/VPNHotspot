@@ -2,6 +2,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use cidr::{Ipv6Cidr, Ipv6Inet};
 
+use crate::shared::proto::daemon::MasqueradeMode;
+
 pub type Network = u64;
 
 /// Daemon reply sockets use Android's local-network fwmark so AOSP routes them through
@@ -25,6 +27,9 @@ pub const DAEMON_REPLY_MARK_MASK: u32 = 0x0003_FFFF;
 /// https://android.googlesource.com/platform/system/netd/+/e11b8688b1f99292ade06f89f957c1f7e76ceae9/include/Fwmark.h#24
 pub const DAEMON_INTERCEPT_FWMARK_VALUE: u32 = 0x1000_0000;
 pub const DAEMON_INTERCEPT_FWMARK_MASK: u32 = 0x1000_0000;
+/// Internal UDP TPROXY listener address. Intercepted packets still carry their original
+/// destination through IPV6_RECVORIGDSTADDR.
+pub const DAEMON_UDP_TPROXY_ADDRESS: Ipv6Addr = Ipv6Addr::LOCALHOST;
 /// Android interface route tables start at ifindex + 1000. Use 900 to leave buffer below
 /// that range while avoiding kernel-reserved tables and AOSP's fixed 97..99 tables.
 pub const DAEMON_TABLE: u32 = 900;
@@ -40,16 +45,10 @@ pub struct SessionConfig {
     pub primary_network: Option<Network>,
     pub primary_routes: Vec<Ipv6Cidr>,
     pub fallback_network: Option<Network>,
-    pub upstreams: Vec<UpstreamConfig>,
+    pub primary_upstream_interfaces: Vec<String>,
+    pub fallback_upstream_interfaces: Vec<String>,
     pub clients: Vec<ClientConfig>,
     pub ipv6_nat: Option<Ipv6NatConfig>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum MasqueradeMode {
-    None,
-    Simple,
-    Netd,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -240,7 +239,8 @@ mod tests {
             primary_network,
             primary_routes,
             fallback_network,
-            upstreams: Vec::new(),
+            primary_upstream_interfaces: Vec::new(),
+            fallback_upstream_interfaces: Vec::new(),
             clients: Vec::new(),
             ipv6_nat: None,
         }
