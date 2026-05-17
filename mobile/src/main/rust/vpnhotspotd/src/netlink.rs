@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex as StdMutex};
 
@@ -6,7 +6,7 @@ use futures_util::{pin_mut, StreamExt, TryStreamExt};
 use rtnetlink::{
     packet_core::NetlinkPayload,
     packet_route::{
-        link::{LinkAttribute, LinkMessage},
+        link::{InfoKind, LinkAttribute, LinkInfo, LinkMessage},
         AddressFamily, RouteNetlinkMessage,
     },
     MulticastGroup,
@@ -15,6 +15,7 @@ use tokio::select;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex, MutexGuard, Notify};
 use tokio::task::JoinHandle;
+use vpnhotspotd::shared::proto::daemon;
 
 use crate::report;
 
@@ -45,7 +46,8 @@ pub(crate) struct Runtime {
     handle: Handle,
     ipv4_address_changed: Arc<Notify>,
     ipv6_address_changed: Arc<Notify>,
-    neighbour_events: Arc<StdMutex<Option<UnboundedSender<RouteNetlinkMessage>>>>,
+    neighbour_events: Arc<EventSlot>,
+    link_events: Arc<EventSlot>,
     task: JoinHandle<()>,
 }
 
@@ -59,11 +61,22 @@ impl Runtime {
         ])?;
         let ipv4_address_changed = Arc::new(Notify::new());
         let ipv6_address_changed = Arc::new(Notify::new());
-        let neighbour_events =
-            Arc::new(StdMutex::new(None::<UnboundedSender<RouteNetlinkMessage>>));
+        let neighbour_events = Arc::new(EventSlot::new(
+            "neighbour monitor already active",
+            "neighbour monitor state poisoned",
+            "netlink.neighbour_registration.drop",
+            "netlink.send_neighbour_event",
+        ));
+        let link_events = Arc::new(EventSlot::new(
+            "link monitor already active",
+            "link monitor state poisoned",
+            "netlink.link_registration.drop",
+            "netlink.send_link_event",
+        ));
         let task_ipv4_address_changed = ipv4_address_changed.clone();
         let task_ipv6_address_changed = ipv6_address_changed.clone();
         let task_neighbour_events = neighbour_events.clone();
+        let task_link_events = link_events.clone();
         let task = tokio::spawn(async move {
             tokio::pin!(connection);
             loop {
@@ -75,6 +88,7 @@ impl Runtime {
                                 &task_ipv4_address_changed,
                                 &task_ipv6_address_changed,
                                 &task_neighbour_events,
+                                &task_link_events,
                             ),
                         None => break,
                     },
@@ -86,6 +100,7 @@ impl Runtime {
             ipv4_address_changed,
             ipv6_address_changed,
             neighbour_events,
+            link_events,
             task,
         })
     }
@@ -108,24 +123,13 @@ impl Runtime {
         NeighbourRegistration,
         UnboundedReceiver<RouteNetlinkMessage>,
     )> {
-        let (sender, receiver) = unbounded_channel();
-        let mut neighbour_events = self
-            .neighbour_events
-            .lock()
-            .map_err(|_| io::Error::other("neighbour monitor state poisoned"))?;
-        if neighbour_events.is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                "neighbour monitor already active",
-            ));
-        }
-        *neighbour_events = Some(sender);
-        Ok((
-            NeighbourRegistration {
-                neighbour_events: self.neighbour_events.clone(),
-            },
-            receiver,
-        ))
+        self.neighbour_events.register()
+    }
+
+    pub(crate) fn register_link_monitor(
+        &self,
+    ) -> io::Result<(LinkRegistration, UnboundedReceiver<RouteNetlinkMessage>)> {
+        self.link_events.register()
     }
 }
 
@@ -135,20 +139,83 @@ impl Drop for Runtime {
     }
 }
 
-pub(crate) struct NeighbourRegistration {
-    neighbour_events: Arc<StdMutex<Option<UnboundedSender<RouteNetlinkMessage>>>>,
+pub(crate) type NeighbourRegistration = EventRegistration;
+pub(crate) type LinkRegistration = EventRegistration;
+
+pub(crate) struct EventRegistration {
+    events: Arc<EventSlot>,
 }
 
-impl Drop for NeighbourRegistration {
+impl Drop for EventRegistration {
     fn drop(&mut self) {
-        match self.neighbour_events.lock() {
-            Ok(mut neighbour_events) => {
-                neighbour_events.take();
+        self.events.unregister();
+    }
+}
+
+struct EventSlot {
+    events: StdMutex<Option<UnboundedSender<RouteNetlinkMessage>>>,
+    duplicate: &'static str,
+    poisoned: &'static str,
+    drop_context: &'static str,
+    send_context: &'static str,
+}
+
+impl EventSlot {
+    fn new(
+        duplicate: &'static str,
+        poisoned: &'static str,
+        drop_context: &'static str,
+        send_context: &'static str,
+    ) -> Self {
+        Self {
+            events: StdMutex::new(None),
+            duplicate,
+            poisoned,
+            drop_context,
+            send_context,
+        }
+    }
+
+    fn register(
+        self: &Arc<Self>,
+    ) -> io::Result<(EventRegistration, UnboundedReceiver<RouteNetlinkMessage>)> {
+        let (sender, receiver) = unbounded_channel();
+        let mut events = self
+            .events
+            .lock()
+            .map_err(|_| io::Error::other(self.poisoned))?;
+        if events.is_some() {
+            return Err(io::Error::new(io::ErrorKind::AlreadyExists, self.duplicate));
+        }
+        *events = Some(sender);
+        Ok((
+            EventRegistration {
+                events: self.clone(),
+            },
+            receiver,
+        ))
+    }
+
+    fn unregister(&self) {
+        match self.events.lock() {
+            Ok(mut events) => {
+                events.take();
             }
-            Err(_) => report::io(
-                "netlink.neighbour_registration.drop",
-                io::Error::other("neighbour monitor state poisoned"),
-            ),
+            Err(_) => report::io(self.drop_context, io::Error::other(self.poisoned)),
+        }
+    }
+
+    fn send(&self, message: RouteNetlinkMessage) {
+        match self.events.lock() {
+            Ok(mut events) => {
+                if events
+                    .as_ref()
+                    .is_some_and(|sender| sender.send(message).is_err())
+                {
+                    events.take();
+                }
+            }
+            Err(_) => report::io(self.send_context, io::Error::other(self.poisoned)),
         }
     }
 }
@@ -237,6 +304,53 @@ pub(crate) async fn link_names(handle: &Handle) -> io::Result<HashMap<u32, Strin
     Ok(names)
 }
 
+pub(crate) async fn bridge_topology(handle: &Handle) -> io::Result<daemon::LinkTopologySnapshot> {
+    let _dump = handle.lock_dump().await;
+    let links = handle.raw().link().get().execute();
+    pin_mut!(links);
+    let mut names = HashMap::new();
+    let mut bridges = HashSet::new();
+    let mut members = Vec::new();
+    while let Some(link) = links.try_next().await.map_err(to_io_error)? {
+        let summary = link_summary_from_message(link);
+        if let Some(name) = summary.name {
+            names.insert(summary.index, name);
+        }
+        if summary.is_bridge {
+            bridges.insert(summary.index);
+        }
+        if let Some(controller) = summary.controller {
+            members.push((summary.index, controller));
+        }
+    }
+    let mut bridge_members = HashMap::<u32, Vec<String>>::new();
+    for (member, bridge) in members {
+        if bridges.contains(&bridge) {
+            if let Some(member_name) = names.get(&member) {
+                bridge_members
+                    .entry(bridge)
+                    .or_default()
+                    .push(member_name.clone());
+            }
+        }
+    }
+    let mut bridge_interfaces = Vec::new();
+    for bridge in bridges {
+        if let Some(name) = names.get(&bridge) {
+            let mut members = bridge_members.remove(&bridge).unwrap_or_default();
+            members.sort_unstable();
+            bridge_interfaces.push(daemon::BridgeInterface {
+                name: name.clone(),
+                members,
+            });
+        }
+    }
+    bridge_interfaces.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+    Ok(daemon::LinkTopologySnapshot {
+        bridges: bridge_interfaces,
+    })
+}
+
 pub(crate) fn validate_interface_name(name: &str) -> io::Result<()> {
     if name.as_bytes().contains(&0) {
         Err(io::Error::new(
@@ -263,15 +377,19 @@ fn dispatch_message(
     payload: NetlinkPayload<RouteNetlinkMessage>,
     ipv4_address_changed: &Notify,
     ipv6_address_changed: &Notify,
-    neighbour_events: &StdMutex<Option<UnboundedSender<RouteNetlinkMessage>>>,
+    neighbour_events: &EventSlot,
+    link_events: &EventSlot,
 ) {
     match payload {
         NetlinkPayload::InnerMessage(
             message @ (RouteNetlinkMessage::NewNeighbour(_) | RouteNetlinkMessage::DelNeighbour(_)),
-        ) => send_neighbour_event(neighbour_events, message),
+        ) => neighbour_events.send(message),
         NetlinkPayload::InnerMessage(
-            RouteNetlinkMessage::NewLink(_) | RouteNetlinkMessage::DelLink(_),
-        ) => ipv4_address_changed.notify_waiters(),
+            message @ (RouteNetlinkMessage::NewLink(_) | RouteNetlinkMessage::DelLink(_)),
+        ) => {
+            ipv4_address_changed.notify_waiters();
+            link_events.send(message);
+        }
         NetlinkPayload::InnerMessage(
             RouteNetlinkMessage::NewAddress(message) | RouteNetlinkMessage::DelAddress(message),
         ) => match message.header.family {
@@ -283,32 +401,38 @@ fn dispatch_message(
     }
 }
 
-fn send_neighbour_event(
-    neighbour_events: &StdMutex<Option<UnboundedSender<RouteNetlinkMessage>>>,
-    message: RouteNetlinkMessage,
-) {
-    match neighbour_events.lock() {
-        Ok(mut neighbour_events) => {
-            if neighbour_events
-                .as_ref()
-                .is_some_and(|sender| sender.send(message).is_err())
-            {
-                neighbour_events.take();
-            }
-        }
-        Err(_) => report::io(
-            "netlink.send_neighbour_event",
-            io::Error::other("neighbour monitor state poisoned"),
-        ),
-    }
+fn link_name_from_message(link: LinkMessage) -> Option<String> {
+    link_summary_from_message(link).name
 }
 
-fn link_name_from_message(link: LinkMessage) -> Option<String> {
-    link.attributes.into_iter().find_map(|attribute| {
-        if let LinkAttribute::IfName(name) = attribute {
-            Some(name)
-        } else {
-            None
+struct LinkSummary {
+    index: u32,
+    name: Option<String>,
+    is_bridge: bool,
+    controller: Option<u32>,
+}
+
+fn link_summary_from_message(link: LinkMessage) -> LinkSummary {
+    let index = link.header.index;
+    let mut name = None;
+    let mut is_bridge = false;
+    let mut controller = None;
+    for attribute in link.attributes {
+        match attribute {
+            LinkAttribute::IfName(value) => name = Some(value),
+            LinkAttribute::Controller(value) => controller = Some(value),
+            LinkAttribute::LinkInfo(info) => {
+                is_bridge |= info
+                    .iter()
+                    .any(|info| matches!(info, LinkInfo::Kind(InfoKind::Bridge)));
+            }
+            _ => {}
         }
-    })
+    }
+    LinkSummary {
+        index,
+        name,
+        is_bridge,
+        controller,
+    }
 }

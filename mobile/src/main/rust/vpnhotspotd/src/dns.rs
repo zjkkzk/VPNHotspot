@@ -3,7 +3,7 @@ use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 
-use libc::{c_int, fcntl, F_GETFL, F_SETFL, O_NONBLOCK};
+use libc::c_int;
 use socket2::SockRef;
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, Interest, Ready};
@@ -15,9 +15,10 @@ use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::report;
-use crate::socket::is_connection_closed;
+use crate::socket::{is_connection_closed, set_nonblocking};
 use vpnhotspotd::shared::dns_wire;
 use vpnhotspotd::shared::model::{Network, SessionConfig};
+use vpnhotspotd::shared::protocol::daemon_io_error_report_with_details;
 
 pub(crate) const DNS_PORT: u16 = 53;
 // android/multinetwork.h: ResNsendFlags::ANDROID_RESOLV_NO_RETRY.
@@ -26,28 +27,63 @@ const ANDROID_RESOLV_NO_RETRY: u32 = 1 << 0;
 const DNS_MAX_PACKET: usize = 65_535;
 
 pub(crate) struct Runtime {
-    pub(crate) tcp_port: u16,
-    pub(crate) udp_port: u16,
+    pub(crate) tcp_port: Option<u16>,
+    pub(crate) udp_port: Option<u16>,
 }
 
 impl Runtime {
     pub(crate) fn start(
+        call_id: u64,
+        downstream: &str,
         bind_address: Ipv4Addr,
         reply_mark: u32,
         config: Arc<Mutex<SessionConfig>>,
         stop: CancellationToken,
-    ) -> io::Result<Self> {
-        let tcp_listener = create_tcp_listener(bind_address, reply_mark)?;
-        let tcp_port = tcp_listener.local_addr()?.port();
-        let udp_socket = create_udp_listener(bind_address, reply_mark)?;
-        let udp_port = udp_socket.local_addr()?.port();
-        spawn_tcp_loop(tcp_listener, config.clone(), stop.clone())?;
-        if let Err(e) = spawn_udp_loop(udp_socket, config, stop.clone()) {
-            stop.cancel();
-            return Err(e);
-        }
-        Ok(Self { tcp_port, udp_port })
+    ) -> Self {
+        let tcp_port = match create_tcp_listener(bind_address, reply_mark).and_then(|listener| {
+            let port = listener.local_addr()?.port();
+            spawn_tcp_loop(listener, config.clone(), stop.clone())?;
+            Ok(port)
+        }) {
+            Ok(port) => Some(port),
+            Err(e) => {
+                report_start_error(call_id, "dns.tcp_start", e, downstream, bind_address);
+                None
+            }
+        };
+        let udp_port = match create_udp_listener(bind_address, reply_mark).and_then(|socket| {
+            let port = socket.local_addr()?.port();
+            spawn_udp_loop(socket, config, stop.clone())?;
+            Ok(port)
+        }) {
+            Ok(port) => Some(port),
+            Err(e) => {
+                report_start_error(call_id, "dns.udp_start", e, downstream, bind_address);
+                None
+            }
+        };
+        Self { tcp_port, udp_port }
     }
+}
+
+fn report_start_error(
+    call_id: u64,
+    context: &str,
+    error: io::Error,
+    downstream: &str,
+    bind_address: Ipv4Addr,
+) {
+    report::report_for(
+        Some(call_id),
+        daemon_io_error_report_with_details(
+            context,
+            error,
+            [
+                ("downstream", downstream.to_owned()),
+                ("bind_address", bind_address.to_string()),
+            ],
+        ),
+    );
 }
 
 struct ResolverQuery {
@@ -88,18 +124,6 @@ impl Drop for ResolverQuery {
                 android_res_cancel(fd);
             }
         }
-    }
-}
-
-fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-    let flags = unsafe { fcntl(fd, F_GETFL) };
-    if flags < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if unsafe { fcntl(fd, F_SETFL, flags | O_NONBLOCK) } < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }
 

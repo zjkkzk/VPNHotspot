@@ -36,6 +36,22 @@ Prefer resource-owner concurrency over broad locks or global serialization.
 ## Rust Daemon Code Hygiene
 Rust daemon code should be event-driven and async-first. Prefer Tokio readiness, cancellation tokens, notifications, channels, and deadline timers over polling loops, fixed sleeps, or manually managed worker threads.
 
+- Keep [`docs/vpnhotspotd`](./docs/vpnhotspotd) in sync with daemon internals. When changing
+  `mobile/src/main/rust/vpnhotspotd`, `mobile/src/main/proto/daemon.proto`, or Kotlin daemon
+  control code under `mobile/src/main/java/be/mygod/vpnhotspot/root/daemon`, update the relevant
+  daemon docs if ownership, lifecycle, cleanup, NAT66, DNS, routing, neighbour monitoring, or
+  structured error semantics change. If no daemon doc update is needed, state why in the change
+  summary.
+- Do not let daemon docs gloss over external side effects. If a Rust daemon change adds, removes, or
+  changes kernel, netfilter, netd, resolver, socket, file descriptor, process, or Android system
+  state, document the trigger, exact external state or command shape, rollback/stop behavior, Clean
+  or process-death behavior, and expected missing-state/failure cases. For routing changes, every
+  route, policy rule, address, iptables/ip6tables rule or chain, `ndc` request, and Clean mutation
+  must be listed in `docs/vpnhotspotd/routing.md`.
+- Avoid large modules. Prefer adding new modules instead of growing existing ones.
+- Target Rust modules under 500 LoC, excluding tests.
+- If a file exceeds roughly 800 LoC, add new functionality in a new module instead of extending the existing file unless there is a strong documented reason not to.
+- When extracting code from a large module, move the related tests and module/type docs toward the new implementation so the invariants stay close to the code that owns them.
 - Do not use `std::thread`, blocking worker loops, `spawn_blocking`, or blocking `std::sync::mpsc` patterns unless a blocking platform API leaves no practical alternative. If one is unavoidable, keep it isolated and document why async readiness cannot be used.
 - Do not add retry loops with fixed sleeps for steady-state work. Use socket readiness, `AsyncFd`, `Notify`, channels, or `sleep_until` deadlines tied to real protocol timers. Short startup-only retries are acceptable only when no readiness source exists yet.
 - Set file descriptors and sockets non-blocking before handing them to Tokio or `AsyncFd`. Do not call blocking `accept`, `recv`, `read`, `write`, DNS, or socket APIs from async tasks.
@@ -59,6 +75,7 @@ Routing, firewall, address, route, and daemon changes should be reversible witho
 - Do not make cleanup depend on private app databases, preferences, caches, or in-memory bookkeeping when the state can outlive the app process.
 - Prefer idempotent mutations such as replace/delete-by-identifier over add-only operations that require remembering exactly what happened earlier.
 - Scope cleanup to mutations this app can identify deterministically. Do not delete or withdraw platform/user state just because it shares an interface or address family.
+- Rare platform/setup edge cases do not require extra compatibility machinery when supporting them would add disproportionate routing or lifecycle complexity. It is acceptable for setup to fail in such cases if the failure is explicit, non-silent, and fully reversible by normal cleanup or Clean.
 - Root-side changes must document their cleanup path, including what happens during normal stop, Clean, reapply, and interrupted startup.
 
 ## Platform API Reflection, Hidden API & Root Changes
@@ -72,6 +89,8 @@ Do not hand-wave platform API reflection, hidden API, or root behavior.
 - Follow existing conventions first. Check similar entries in `README.md`, `../hiddenapi/hiddenapi-flags.csv`, and nearby source comments before adding new ones.
 - Do not search for hiddenapi data elsewhere. Use the provided `../hiddenapi/hiddenapi-flags.csv`, and do not edit it unless explicitly asked.
 - Before adding, removing, or reclassifying any Android API entry in `README.md`, verify the exact descriptor and exact overload in `../hiddenapi/hiddenapi-flags.csv`. Do not infer access category from class-level knowledge, AOSP source, or a sibling overload.
+- Never guess or synthesize hiddenapi flag suffixes. The suffix after the descriptor, such as `blocked`, `unsupported`, or `sdk,system-api,test-api`, must come from an exact descriptor match in `../hiddenapi/hiddenapi-flags.csv`.
+- AOSP API signature files such as `current.txt`, `system-current.txt`, annotations such as `@SystemApi`/`@FlaggedApi`, and SDK stubs may support API-surface or availability conclusions, but they do not prove hiddenapi flags. If the exact descriptor is absent from `../hiddenapi/hiddenapi-flags.csv`, do not append a flag suffix; document the absence explicitly when it matters.
 - Treat `public-api` as a stop sign for `Hidden whitelisted APIs` and `Private APIs used / Assumptions for Android customizations` unless this app also uses a different non-public member with its own descriptor.
 - Update the correct `README.md` bucket: blocked/private/internal APIs go in `Private APIs used / Assumptions for Android customizations`, reflected `sdk/system-api/test-api` goes in `Hidden whitelisted APIs`, and non-descriptor platform assumptions or AOSP behavior notes go under `Other`.
 - Treat `README.md` as a compatibility-hazard index for assumptions that matter if violated.

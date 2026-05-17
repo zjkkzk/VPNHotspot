@@ -15,7 +15,9 @@ import android.view.ViewGroup
 import android.widget.EditText
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.widget.PopupMenu
-import androidx.collection.LongSparseArray
+import androidx.collection.LongObjectMap
+import androidx.collection.MutableScatterMap
+import androidx.collection.ObjectList
 import androidx.core.view.isVisible
 import androidx.databinding.BaseObservable
 import androidx.fragment.app.Fragment
@@ -182,7 +184,7 @@ class ClientsFragment : Fragment() {
     private inner class ClientAdapter : ListAdapter<Client, ClientViewHolder>(Client) {
         var size = CompletableDeferred(0)
 
-        override fun submitList(list: MutableList<Client>?) {
+        override fun submitList(list: List<Client>?) {
             binding.empty.isVisible = list.isNullOrEmpty()
             val deferred = CompletableDeferred<Int>()
             size = deferred
@@ -193,22 +195,27 @@ class ClientsFragment : Fragment() {
         override fun onBindViewHolder(holder: ClientViewHolder, position: Int) {
             val client = getItem(position)
             holder.binding.client = client
-            holder.binding.rate = rates.computeIfAbsent(client.iface to client.mac) { TrafficRate() }
+            holder.binding.rate = rates.compute(client.iface to client.mac) { _, rate -> rate ?: TrafficRate() }
             holder.binding.executePendingBindings()
         }
 
-        fun updateTraffic(newRecords: Collection<TrafficRecord>, oldRecords: LongSparseArray<TrafficRecord>) {
-            for (rate in rates.values) rate.clear()
-            for (newRecord in newRecords) {
-                val oldRecord = oldRecords[newRecord.previousId ?: continue] ?: continue
+        fun updateTraffic(newRecords: ObjectList<TrafficRecord>, oldRecords: LongObjectMap<TrafficRecord>) {
+            rates.forEachValue { it.clear() }
+            val rateKeys = MutableScatterMap<Pair<String, MacAddress>, Pair<String?, MacAddress>>()
+            currentList.forEach { client ->
+                client.ifaces.forEach { rateKeys[it to client.mac] = client.iface to client.mac }
+            }
+            newRecords.forEach { newRecord ->
+                val oldRecord = oldRecords[newRecord.previousId ?: return@forEach] ?: return@forEach
                 val elapsed = newRecord.timestamp - oldRecord.timestamp
                 if (elapsed == 0L) {
                     if (newRecord.sentPackets != oldRecord.sentPackets || newRecord.sentBytes != oldRecord.sentBytes ||
                         newRecord.receivedPackets != oldRecord.receivedPackets ||
                         newRecord.receivedBytes != oldRecord.receivedBytes) Timber.w(Exception("wtf"))
-                    continue
+                    return@forEach
                 }
-                val rate = rates.computeIfAbsent(newRecord.downstream to newRecord.mac) { TrafficRate() }
+                val key = rateKeys[newRecord.downstream to newRecord.mac] ?: (newRecord.downstream to newRecord.mac)
+                val rate = rates.compute(key) { _, rate -> rate ?: TrafficRate() }
                 if (rate.send < 0 || rate.receive < 0) {
                     rate.send = 0
                     rate.receive = 0
@@ -216,13 +223,13 @@ class ClientsFragment : Fragment() {
                 rate.send += (newRecord.sentBytes - oldRecord.sentBytes) * 1000 / elapsed
                 rate.receive += (newRecord.receivedBytes - oldRecord.receivedBytes) * 1000 / elapsed
             }
-            for (rate in rates.values) rate.notifyChange()
+            rates.forEachValue { it.notifyChange() }
         }
     }
 
     private lateinit var binding: FragmentClientsBinding
     private val adapter = ClientAdapter()
-    private var rates = mutableMapOf<Pair<String?, MacAddress>, TrafficRate>()
+    private var rates = MutableScatterMap<Pair<String?, MacAddress>, TrafficRate>()
 
     override fun onCreateView(inflater: LayoutInflater, container: ViewGroup?, savedInstanceState: Bundle?): View {
         binding = FragmentClientsBinding.inflate(inflater, container, false)
@@ -231,7 +238,7 @@ class ClientsFragment : Fragment() {
         binding.clients.adapter = adapter
         activityViewModels<ClientViewModel>().value.apply {
             lifecycle.addObserver(clientsFragmentObserver)
-            clients.observe(viewLifecycleOwner) { adapter.submitList(it.toMutableList()) }
+            clients.observe(viewLifecycleOwner) { adapter.submitList(it) }
         }
         viewLifecycleOwner.lifecycleScope.launch {
             viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {

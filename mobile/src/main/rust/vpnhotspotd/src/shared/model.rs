@@ -30,6 +30,8 @@ pub const DAEMON_INTERCEPT_FWMARK_MASK: u32 = 0x1000_0000;
 /// Internal UDP TPROXY listener address. Intercepted packets still carry their original
 /// destination through IPV6_RECVORIGDSTADDR.
 pub const DAEMON_UDP_TPROXY_ADDRESS: Ipv6Addr = Ipv6Addr::LOCALHOST;
+/// Internal NFQUEUE number for NAT66 ICMPv6 Echo interception.
+pub const DAEMON_ICMP_NFQUEUE_NUM: u16 = 30_063;
 /// Android interface route tables start at ifindex + 1000. Use 900 to leave buffer below
 /// that range while avoiding kernel-reserved tables and AOSP's fixed 97..99 tables.
 pub const DAEMON_TABLE: u32 = 900;
@@ -82,15 +84,16 @@ pub struct Ipv6NatConfig {
 
 #[derive(Clone, Copy)]
 pub struct SessionPorts {
-    pub dns_tcp: u16,
-    pub dns_udp: u16,
+    pub dns_tcp: Option<u16>,
+    pub dns_udp: Option<u16>,
     pub ipv6_nat: Option<Ipv6NatPorts>,
 }
 
 #[derive(Clone, Copy)]
 pub struct Ipv6NatPorts {
-    pub tcp: u16,
-    pub udp: u16,
+    pub tcp: Option<u16>,
+    pub udp: Option<u16>,
+    pub icmp_echo: bool,
 }
 
 pub fn ipv6_nat_prefix(seed: &str, interface: &str) -> Ipv6Cidr {
