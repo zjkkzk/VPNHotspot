@@ -2,10 +2,11 @@ use crate::firewall::IptablesTarget;
 use vpnhotspotd::shared::icmp_nat::icmp_echo_rule_args;
 use vpnhotspotd::shared::model::{
     Ipv6NatConfig, Ipv6NatPorts, SessionConfig, DAEMON_ICMP_NFQUEUE_NUM, DAEMON_REPLY_MARK,
-    DAEMON_REPLY_MARK_MASK, DAEMON_UDP_TPROXY_ADDRESS,
+    DAEMON_REPLY_MARK_MASK,
 };
 
 use super::iptables::{IptablesChain, IptablesRule};
+use super::ipv6_nat_intercept::Ipv6NatInterceptMode;
 use super::{push_unique, RoutingMutation};
 
 pub(super) struct Ipv6NatFirewall;
@@ -38,7 +39,8 @@ impl Ipv6NatFirewall {
         mutations: &mut Vec<RoutingMutation>,
         config: &SessionConfig,
         ipv6_nat: &Ipv6NatConfig,
-        ports: Ipv6NatPorts,
+        ports: &Ipv6NatPorts,
+        intercept_mode: Ipv6NatInterceptMode,
     ) {
         for chain in Self::NAT_FILTER_JUMPS
             .into_iter()
@@ -67,10 +69,18 @@ impl Ipv6NatFirewall {
                 RoutingMutation::Iptables(Self::icmp_echo_rule(config, ipv6_nat)),
             );
         }
-        for rule in Self::tproxy_port_rules(config, ports) {
+        for rule in Self::tproxy_port_rules(config, ports, intercept_mode) {
             push_unique(mutations, RoutingMutation::Iptables(rule));
         }
-        // Iptables rules are installed with -I; these land before the ACL gate.
+        for rule in Self::local_special_return_rules(config, ipv6_nat) {
+            push_unique(mutations, RoutingMutation::Iptables(rule));
+        }
+        for protocol in Self::enabled_listener_protocols(ports) {
+            for rule in Self::gateway_dns_prelude_rules(config, ipv6_nat, protocol) {
+                push_unique(mutations, RoutingMutation::Iptables(rule));
+            }
+        }
+        // Iptables rules are installed with -I; these land above DNS/local special cases.
         for rule in Self::tproxy_icmpv6_control_rules(config) {
             push_unique(mutations, RoutingMutation::Iptables(rule));
         }
@@ -84,46 +94,8 @@ impl Ipv6NatFirewall {
     }
 
     fn filter_rules(config: &SessionConfig) -> Vec<IptablesRule> {
-        vec![
-            IptablesRule::new(
-                IptablesTarget::Ipv6,
-                "filter",
-                "vpnhotspot_v6_input",
-                vec![
-                    "-i".into(),
-                    config.downstream.clone(),
-                    "-j".into(),
-                    "REJECT".into(),
-                ],
-            ),
-            IptablesRule::new(
-                IptablesTarget::Ipv6,
-                "filter",
-                "vpnhotspot_v6_input",
-                vec![
-                    "-i".into(),
-                    config.downstream.clone(),
-                    "-m".into(),
-                    "socket".into(),
-                    "--transparent".into(),
-                    "--nowildcard".into(),
-                    "-j".into(),
-                    "ACCEPT".into(),
-                ],
-            ),
-            IptablesRule::new(
-                IptablesTarget::Ipv6,
-                "filter",
-                "vpnhotspot_v6_input",
-                vec![
-                    "-i".into(),
-                    config.downstream.clone(),
-                    "-p".into(),
-                    "icmpv6".into(),
-                    "-j".into(),
-                    "ACCEPT".into(),
-                ],
-            ),
+        let mut rules = Self::input_filter_rules(config).to_vec();
+        rules.extend([
             IptablesRule::new(
                 IptablesTarget::Ipv6,
                 "filter",
@@ -180,6 +152,51 @@ impl Ipv6NatFirewall {
                     "ACCEPT".into(),
                 ],
             ),
+        ]);
+        rules
+    }
+
+    pub(super) fn input_filter_rules(config: &SessionConfig) -> [IptablesRule; 3] {
+        [
+            IptablesRule::new(
+                IptablesTarget::Ipv6,
+                "filter",
+                "vpnhotspot_v6_input",
+                vec![
+                    "-i".into(),
+                    config.downstream.clone(),
+                    "-j".into(),
+                    "REJECT".into(),
+                ],
+            ),
+            IptablesRule::new(
+                IptablesTarget::Ipv6,
+                "filter",
+                "vpnhotspot_v6_input",
+                vec![
+                    "-i".into(),
+                    config.downstream.clone(),
+                    "-m".into(),
+                    "socket".into(),
+                    "--transparent".into(),
+                    "--nowildcard".into(),
+                    "-j".into(),
+                    "ACCEPT".into(),
+                ],
+            ),
+            IptablesRule::new(
+                IptablesTarget::Ipv6,
+                "filter",
+                "vpnhotspot_v6_input",
+                vec![
+                    "-i".into(),
+                    config.downstream.clone(),
+                    "-p".into(),
+                    "icmpv6".into(),
+                    "-j".into(),
+                    "ACCEPT".into(),
+                ],
+            ),
         ]
     }
 
@@ -200,40 +217,7 @@ impl Ipv6NatFirewall {
         )
     }
 
-    fn tproxy_port_rules(config: &SessionConfig, ports: Ipv6NatPorts) -> Vec<IptablesRule> {
-        [("tcp", ports.tcp), ("udp", ports.udp)]
-            .into_iter()
-            .filter_map(|(protocol, port)| {
-                let port = port?;
-                let mut args = vec![
-                    "-i".into(),
-                    config.downstream.clone(),
-                    "-p".into(),
-                    protocol.into(),
-                    "-j".into(),
-                    "TPROXY".into(),
-                ];
-                if protocol == "udp" {
-                    // Keep listener socket lookup disjoint from exact-bound UDP reply sockets.
-                    args.extend(["--on-ip".into(), DAEMON_UDP_TPROXY_ADDRESS.to_string()]);
-                }
-                args.extend([
-                    "--on-port".into(),
-                    port.to_string(),
-                    "--tproxy-mark".into(),
-                    "0x10000000/0x10000000".into(),
-                ]);
-                Some(IptablesRule::new(
-                    IptablesTarget::Ipv6,
-                    "mangle",
-                    "vpnhotspot_v6_protocols",
-                    args,
-                ))
-            })
-            .collect()
-    }
-
-    fn icmp_echo_rule(config: &SessionConfig, ipv6_nat: &Ipv6NatConfig) -> IptablesRule {
+    pub(super) fn icmp_echo_rule(config: &SessionConfig, ipv6_nat: &Ipv6NatConfig) -> IptablesRule {
         IptablesRule::new(
             IptablesTarget::Ipv6,
             "mangle",
@@ -313,6 +297,15 @@ impl Ipv6NatFirewall {
                 )
             })
             .collect()
+    }
+
+    pub(super) fn filter_input_jump_rule() -> IptablesRule {
+        IptablesRule::new(
+            IptablesTarget::Ipv6,
+            "filter",
+            "INPUT",
+            vec!["-j".into(), "vpnhotspot_v6_input".into()],
+        )
     }
 
     pub(super) fn prerouting_rule() -> IptablesRule {

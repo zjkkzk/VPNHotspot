@@ -87,6 +87,7 @@
     <string name="connected_state_failed">" (ロスト)"</string>
     <string name="clients_empty">クライアントが接続されていません</string>
     <string name="clients_popup_nickname">ニックネーム…</string>
+    <string name="clients_nickname_hint">ニックネーム</string>
     <string name="clients_popup_block">ブロック</string>
     <string name="clients_popup_block_service_inactive">このインターフェースのサービスを ON にすると、このクライアントはブロックされます。</string>
     <string name="clients_popup_unblock">ブロックを解除</string>
@@ -95,14 +96,11 @@
     <string name="clients_nickname_title">%s のニックネーム</string>
     <string name="clients_nickname_set_to_vendor">← 🏳️‍🌈 ベンダー</string>
     <string name="clients_stats_title">^1 の状態</string>
-    <plurals name="clients_stats_message_1">
-        <item quantity="other">%1$s 回、%2$s に接続しました</item>
-    </plurals>
     <plurals name="clients_stats_message_2">
-        <item quantity="other">送信: %1$s | パケット: %2$s</item>
+        <item quantity="other">\n送信: ^1 | パケット: ^2</item>
     </plurals>
     <plurals name="clients_stats_message_3">
-        <item quantity="other">受信: %1$s | パケット: %2$s</item>
+        <item quantity="other">\n受信: ^1 | パケット: ^2</item>
     </plurals>
     <string name="settings_upstream">アップストリーム</string>
     <string name="settings_downstream">ダウンストリーム</string>
@@ -158,7 +156,6 @@
         <item quantity="other">%d 個のデバイス</item>
     </plurals>
     <string name="failure_reason_unknown">不明 #%d</string>
-    <string name="noisy_su_failure">問題が発生しました。デバッグ情報を確認してください。</string>
     <string name="permission_missing">権限がありません</string>
     <string name="configuration_view">Wi\u2011Fi の構成</string>
     <string name="configuration_invalid">無効な設定の可能性があります</string>

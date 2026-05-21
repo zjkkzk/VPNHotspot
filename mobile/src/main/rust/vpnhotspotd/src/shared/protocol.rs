@@ -8,6 +8,7 @@ use std::process;
 use cidr::{Ipv6Cidr, Ipv6Inet};
 use prost::Message;
 
+use crate::shared::ipsec::IpSecForwardPolicyTarget;
 use crate::shared::model::{
     ipv6_nat_gateway, ipv6_nat_prefix, ClientConfig, Ipv6NatConfig, SessionConfig,
     DAEMON_REPLY_MARK,
@@ -204,12 +205,10 @@ pub fn ack_reply_frame(id: u64) -> Vec<u8> {
     reply_frame(id, daemon::reply_frame::Payload::Ack(daemon::Ack {}))
 }
 
-pub fn traffic_counter_lines_frame(id: u64, lines: &[String]) -> Vec<u8> {
+pub fn traffic_counters_frame(id: u64, counters: Vec<daemon::TrafficCounter>) -> Vec<u8> {
     reply_frame(
         id,
-        daemon::reply_frame::Payload::TrafficCounterLines(daemon::TrafficCounterLines {
-            lines: lines.to_vec(),
-        }),
+        daemon::reply_frame::Payload::TrafficCounters(daemon::TrafficCounters { counters }),
     )
 }
 
@@ -230,6 +229,19 @@ where
         daemon::event_frame::Payload::NeighbourMonitor(daemon::NeighbourMonitorUpdate {
             neighbour_deltas: neighbour_deltas.into_iter().collect(),
             link_topology,
+        }),
+    )
+}
+
+pub fn ipsec_forward_policy_frame(id: u64, target: &IpSecForwardPolicyTarget) -> Vec<u8> {
+    event_frame(
+        id,
+        daemon::event_frame::Payload::IpsecForwardPolicy(daemon::IpSecForwardPolicyRequest {
+            uid: target.uid,
+            source_address: target.source_address.clone(),
+            destination_address: target.destination_address.clone(),
+            mark_value: target.mark_value,
+            xfrm_interface_id: target.xfrm_interface_id,
         }),
     )
 }
@@ -434,5 +446,22 @@ mod tests {
                 value: "iptables-restore".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn read_session_config_accepts_client_without_ipv4() {
+        let config = read_session_config(daemon::SessionConfig {
+            downstream: "ncm0".to_owned(),
+            clients: vec![daemon::ClientConfig {
+                mac: vec![2, 3, 5, 7, 11, 13],
+                ipv4: Vec::new(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        assert_eq!(config.clients.len(), 1);
+        assert_eq!(config.clients[0].mac, [2, 3, 5, 7, 11, 13]);
+        assert!(config.clients[0].ipv4.is_empty());
     }
 }

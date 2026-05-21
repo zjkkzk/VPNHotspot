@@ -57,19 +57,70 @@ path fails.
 
 ### IPv4 DNS Redirect
 
-Condition: per protocol when DNS startup produced that listener port.
+Condition: the owned nat chain and PREROUTING jump are present for a started
+session with downstream IPv4. Per-MAC redirect rules are present per committed
+client MAC and protocol when DNS startup produced that MAC/protocol listener
+port and routing can also install the matching direct-port guard.
 
 External mutations:
 
-- `iptables -t nat -I PREROUTING -i <downstream> -p tcp -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-tcp-port>`
-- `iptables -t nat -I PREROUTING -i <downstream> -p udp -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-udp-port>`
+- ensure `iptables -t nat` chain `vpnhotspot_dns_nat`
+- `iptables -t nat -I PREROUTING -j vpnhotspot_dns_nat`
+- `iptables -t nat -I vpnhotspot_dns_nat -i <downstream> -p tcp -m mac --mac-source <mac> -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-tcp-port-for-mac>`
+- `iptables -t nat -I vpnhotspot_dns_nat -i <downstream> -p udp -m mac --mac-source <mac> -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-udp-port-for-mac>`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p tcp -d <downstream-ipv4> --dport <dns-tcp-port-for-mac> -m conntrack --ctorigdst <downstream-ipv4> --ctorigdstport 53 -j RETURN`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p tcp -d <downstream-ipv4> --dport <dns-tcp-port-for-mac> -j REJECT --reject-with tcp-reset`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p udp -d <downstream-ipv4> --dport <dns-udp-port-for-mac> -m conntrack --ctorigdst <downstream-ipv4> --ctorigdstport 53 -j RETURN`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p udp -d <downstream-ipv4> --dport <dns-udp-port-for-mac> -j REJECT --reject-with icmp-port-unreachable`
+
+Effective order for a listener port is the conntrack original-destination
+`RETURN` before the direct-port `REJECT`. The guard makes the ephemeral listener
+port reachable only as the post-DNAT target of a packet originally addressed to
+the downstream gateway on port 53. If routing cannot install or validate the
+conntrack original-destination guard, it must omit that MAC/protocol DNS
+capability instead of exposing the listener port directly.
+
+The guard lines above are the required effective order. Because iptables `-I`
+inserts at the head by default, implementation must either insert with explicit
+positions or apply paired guard mutations in the reverse order that produces the
+effective chain order.
 
 Rollback:
 
-- delete the same protocol rules.
+- delete the PREROUTING jump and the same MAC/protocol redirect and guard rules.
+- no session rollback for the `vpnhotspot_dns_nat` chain itself.
 
-Routing only redirects packets. DNS upstream selection belongs to
-[`dns.rs`](../../mobile/src/main/rust/vpnhotspotd/src/dns.rs).
+Routing only redirects packets. MAC ownership and DNS upstream selection belong
+to [`dns.rs`](../../mobile/src/main/rust/vpnhotspotd/src/dns.rs). A DNS
+listener is not committed unless both the listener and matching MAC redirect
+and direct-port guard rules exist.
+
+### IPv4 Gateway DNS Denial
+
+Condition: always present for a started session with downstream IPv4.
+
+External mutations:
+
+- ensure `iptables -t filter` chain `vpnhotspot_dns_input`
+- `iptables -t filter -I INPUT -j vpnhotspot_dns_input`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p tcp -d <downstream-ipv4> --dport 53 -j REJECT --reject-with tcp-reset`
+- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p udp -d <downstream-ipv4> --dport 53 -j REJECT --reject-with icmp-port-unreachable`
+
+Rollback:
+
+- delete the INPUT jump and downstream reject rules.
+- no session rollback for the chain itself.
+
+Clean:
+
+- delete the INPUT jump, then flush and delete `vpnhotspot_dns_input`.
+- delete the PREROUTING jump, then flush and delete `vpnhotspot_dns_nat`.
+
+Allowed DNS packets have already been DNATed to per-MAC daemon listener ports in
+`vpnhotspot_dns_nat`, so these rules catch blocked clients and missing DNS
+capability cases that remain addressed to the gateway on port 53. They do not
+block manually configured external DNS except through the normal upstream
+admission rules.
 
 ### IPv4 Downstream Block Rule
 
@@ -205,8 +256,8 @@ Clean:
 
 ### NAT66 Routes, Address, And Policy Rule
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability in `SessionPorts.ipv6_nat`.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutations:
 
@@ -216,8 +267,16 @@ External mutations:
   `<nat66-gateway>/<prefix-len> dev <downstream>`
 - replace IPv6 local route in table 900:
   `local ::/0 dev lo table 900`
-- replace IPv6 policy rule:
-  `iif <downstream> priority <daemon-priority> fwmark 0x10000000/0x10000000 lookup 900`
+- NAT66 daemon policy-rule priority is `20600` on API 31+ and `17600` on
+  API 29..30.
+- in protocol-rule mode, replace one IPv6 policy rule per active NAT66
+  listener protocol:
+  - TCP listener present:
+    `iif <downstream> priority <nat66-daemon-priority> ipproto tcp lookup 900`
+  - UDP listener present:
+    `iif <downstream> priority <nat66-daemon-priority> ipproto udp lookup 900`
+- in fwmark fallback mode, replace one IPv6 policy rule:
+  `iif <downstream> priority <nat66-daemon-priority> fwmark 0x10000000/0x10000000 lookup 900`
 
 Rollback:
 
@@ -233,10 +292,30 @@ Clean:
 Clean never flushes table 99 because it is Android's shared `local_network`
 table.
 
+Before routing the first candidate NAT66 TCP/UDP listener ports, routing probes
+kernel `FRA_IP_PROTO` support through rtnetlink once per daemon process and
+reuses the cached result for later NAT66 sessions. NAT66-enabled sessions with
+no candidate TCP/UDP listener ports do not probe yet because there is no
+listener interception rule to choose. The probe adds a temporary
+detached-interface rule at `<nat66-daemon-priority>`:
+`iif vpnhs_probe0 priority <nat66-daemon-priority> ipproto tcp lookup 900`. Routing
+then dumps IPv6 rules and requires the echoed rule to include `ipproto tcp`.
+The probe deletes both the exact protocol rule and a possible no-protocol stale
+form. This detached interface is intentional: kernels without `FRA_IP_PROTO`
+can silently ignore the unknown attribute and accept a bare
+`iif ... lookup 900` rule, so probing with the real downstream would create a
+transient or leaked traffic-affecting rule.
+
+If the probe fails, routing uses fwmark fallback mode. When `uname.release`
+parses as Linux 4.17 or newer, the fallback is also reported as a structured
+nonfatal warning tied to the start-session call because upstream Linux has
+supported `FRA_IP_PROTO` since 4.17. Older or unparsable releases use fallback
+without that warning.
+
 ### NAT66 Firewall Chains
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutations:
 
@@ -258,8 +337,8 @@ Clean:
 
 ### NAT66 Filter Rules
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutations:
 
@@ -284,8 +363,8 @@ The mark value is `DAEMON_REPLY_MARK/DAEMON_REPLY_MARK_MASK`.
 
 ### NAT66 ACL Gate
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutation:
 
@@ -305,7 +384,7 @@ Condition: `SessionConfig.ipv6_nat != null` and NAT66 runtime reported
 
 External mutation:
 
-- `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p icmpv6 --icmpv6-type echo-request ! -d <nat66-gateway> -j NFQUEUE --queue-num 30063`
+- `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p icmpv6 --icmpv6-type echo-request ! -d <nat66-gateway> -j NFQUEUE --queue-num 30000`
 
 Rollback:
 
@@ -313,31 +392,83 @@ Rollback:
 
 Routing must omit this rule when ICMP registration failed. Packets must not be
 queued unless the process-wide ICMP dispatcher has a live session registration
-for the downstream interface.
+for the downstream interface. The rule is session-level rather than per-MAC
+because NAT66 ACL admission has already run before protocol interception.
+
+ICMP Echo interception intentionally uses NFQUEUE rather than TCP/UDP-style
+TPROXY. ICMP has no destination port for a transparent listener, and the daemon
+must drop the original queued Echo Request after copying it so it cannot continue
+through another forwarding path alongside the daemon's translated probe.
+
+The dispatcher attributes queued packets from `NFQA_HWADDR`. Missing
+hardware-address metadata, non-six-byte hardware addresses, and MACs outside
+the committed client set are dropped and reported as structured nonfatals. The
+dispatcher must not fall back to source IPv6 neighbour lookup.
 
 ### NAT66 TCP/UDP TPROXY
 
-Condition: per protocol when `SessionConfig.ipv6_nat != null` and NAT66 startup
-returned that listener port.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability. Gateway DNS preludes and local/special
+destination returns are session-level rules. Listener TPROXY rules are per
+committed client MAC/protocol listener port. NAT66 gateway DNS and upstream
+proxying share the same per-MAC listener; the daemon distinguishes gateway DNS
+by the original destination. Local or special destinations should not enter the
+daemon-owned upstream proxy path.
 
 External mutations:
 
-- TCP:
-  `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p tcp -j TPROXY --on-port <nat66-tcp-port> --tproxy-mark 0x10000000/0x10000000`
-- UDP:
-  `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p udp -j TPROXY --on-ip ::1 --on-port <nat66-udp-port> --tproxy-mark 0x10000000/0x10000000`
+- gateway DNS TCP ACL/protocol prelude:
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -p tcp -d <nat66-gateway> --dport 53 -j vpnhotspot_v6_acl_gate`
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -p tcp -d <nat66-gateway> --dport 53 -j vpnhotspot_v6_protocols`
+- gateway DNS UDP ACL/protocol prelude:
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -p udp -d <nat66-gateway> --dport 53 -j vpnhotspot_v6_acl_gate`
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -p udp -d <nat66-gateway> --dport 53 -j vpnhotspot_v6_protocols`
+- local/special destination returns before the generic upstream ACL/proxy path:
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -d <nat66-prefix> -j RETURN`
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -d fe80::/10 -j RETURN`
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -d ff00::/8 -j RETURN`
+  - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -i <downstream> -d ::/127 -j RETURN`
+- TCP listener:
+  - `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p tcp -m mac --mac-source <mac> -j TPROXY --on-ip ::1 --on-port <nat66-tcp-port-for-mac>`
+- UDP listener:
+  - `ip6tables -t mangle -I vpnhotspot_v6_protocols -i <downstream> -p udp -m mac --mac-source <mac> -j TPROXY --on-ip ::1 --on-port <nat66-udp-port-for-mac>`
+
+Effective mangle order is gateway DNS `:53` ACL gate, gateway DNS `:53`
+protocol interception, local/special destination returns, generic upstream ACL
+gate, then broad per-MAC listener TPROXY for the remaining TCP or UDP traffic.
+Gateway DNS enters the same listener as ordinary upstream traffic, but the
+daemon routes it to DNS handling from the original destination. This keeps local
+traffic outside NAT66 admission while still applying the allow/block decision to
+daemon-owned DNS and upstream proxying.
+
+The command list above is the required effective order. Because iptables `-I`
+inserts at the head by default, implementation must either insert with explicit
+positions or apply rule mutations in the reverse order that produces the
+effective chain order.
+
+In fwmark fallback mode, the TPROXY rules also append
+`--tproxy-mark 0x10000000/0x10000000`.
 
 Rollback:
 
 - delete the same rules.
 
-The UDP rule uses `--on-ip ::1` to keep listener socket lookup disjoint from
-exact-bound UDP reply sockets.
+The TCP and UDP rules use `--on-ip ::1`, and the listeners bind to `::1`.
+Listener ports are internal TPROXY endpoints rather than downstream-reachable
+service ports. Direct downstream local/special traffic to those ports does not
+match the listener and falls through the base input reject path.
+
+A per-MAC TCP or UDP listener is not committed unless the daemon listener,
+required session-level local/special exclusions, base input filter rules,
+gateway DNS preludes, and matching MAC-scoped listener TPROXY rule all exist.
+If routing fails the rules required for that MAC/protocol, the staged listener
+is cancelled and that MAC/protocol capability is omitted from the committed
+session.
 
 ### NAT66 ICMPv6 Control Returns
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutations:
 
@@ -354,8 +485,8 @@ Advertisement. They are local-link control traffic, not upstream NAT66 payload.
 
 ### NAT66 Filter Base Jumps
 
-Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup returned at least
-one runtime capability.
+Condition: `SessionConfig.ipv6_nat != null` and NAT66 startup committed at
+least one TCP or UDP runtime capability.
 
 External mutations:
 
@@ -386,32 +517,51 @@ Clean deletes this repeatedly before flushing and deleting NAT66 mangle chains.
 
 ### Client IPv4 Allow And Stats Rules
 
-Condition: for each unique client MAC in `SessionConfig.clients`.
+Condition: for each committed unique `(client MAC, client IPv4 address)` pair
+in `SessionConfig.clients`.
 
 External mutations:
 
-- `iptables -t filter -I vpnhotspot_acl -i <downstream> -m mac --mac-source <mac> -j ACCEPT`
-- `iptables -t filter -I vpnhotspot_acl -i <downstream> -m mac --mac-source <mac> -j vpnhotspot_stats`
+- `iptables -t filter -I vpnhotspot_acl -i <downstream> -m mac --mac-source <mac> -s <client-ipv4> -j vpnhotspot_stats`
+
+Rollback:
+
+- delete the same rule.
+
+Condition: for each committed unique `(client MAC, client IPv4 address)` pair
+in `SessionConfig.clients`.
+
+External mutations:
+
+- `iptables -t filter -I vpnhotspot_stats -i <downstream> -m mac --mac-source <mac> -s <client-ipv4> -j ACCEPT`
+- `iptables -t filter -I vpnhotspot_stats -o <downstream> -d <client-ipv4> -j ACCEPT`
 
 Rollback:
 
 - delete the same rules.
 
-Condition: for each unique client IPv4 address in `SessionConfig.clients`.
+The IPv4 forwarding admission whitelist is the committed `(MAC, IPv4)` pair.
+Sent-direction packets must match both the client MAC and IPv4 source before
+entering the stats chain, and the stats leaf that increments the counter is also
+the rule that accepts the packet. Reply-direction packets are counted by
+destination IPv4 after the generic `ESTABLISHED,RELATED` ACL path sends them
+through `vpnhotspot_stats`; the client MAC is not available as the Ethernet
+source on replies. A committed MAC with no IPv4 address leaves has no IPv4
+forwarding capability and can still be authorized for DNS or NAT66.
 
-External mutations:
-
-- `iptables -t filter -I vpnhotspot_stats -i <downstream> -s <client-ipv4> -j RETURN`
-- `iptables -t filter -I vpnhotspot_stats -o <downstream> -d <client-ipv4> -j RETURN`
-
-Rollback:
-
-- delete the same rules.
+During session replacement, if a client IPv4 address remains committed but its
+owning MAC changes, routing first deletes that address's two
+`vpnhotspot_stats` rules from the applied mutation set. Normal reconciliation
+then reinserts the same rule shape for the new committed config, which resets
+the kernel iptables counters before Kotlin associates the source with the new
+MAC. Missing rules only clear the current process applied entry; command
+execution failures are reported and the rest of reconciliation continues.
 
 ### Client NAT66 Allow Rules
 
-Condition: `SessionConfig.ipv6_nat != null`, NAT66 startup returned at least
-one runtime capability, and for each unique client MAC in `SessionConfig.clients`.
+Condition: `SessionConfig.ipv6_nat != null`, NAT66 startup committed at least
+one TCP or UDP runtime capability, and for each committed unique client MAC in
+`SessionConfig.clients`.
 
 External mutation:
 
@@ -422,7 +572,10 @@ Rollback:
 - delete the same rule.
 
 The NAT66 base ACL drop rule is process-wide; client allow rules return before
-that drop.
+that drop. NAT66 TCP/UDP rules still match MAC again to select that MAC's
+listener port. NAT66 ICMPv6 uses the ACL result for admission, then the
+dispatcher verifies the queued packet's `NFQA_HWADDR` against the same committed
+MAC set before proxying or counting it.
 
 ## Process-Wide NAT66 Firewall Base
 
@@ -441,6 +594,15 @@ External mutations:
 - `ip6tables -t mangle -I vpnhotspot_acl -j DROP`
 - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -j vpnhotspot_v6_protocols`
 - `ip6tables -t mangle -I vpnhotspot_v6_tproxy -j vpnhotspot_v6_acl_gate`
+
+Because these rules are inserted with `-I`, session rules must preserve the
+effective `vpnhotspot_v6_tproxy` order documented above: local-link ICMPv6
+control returns, gateway DNS ACL/protocol handling, local/special destination
+returns, generic ACL gate, then protocol interception. That ordering is part of
+the NAT66 blocking contract: blocked MACs hit the base ACL drop before
+daemon-owned DNS, upstream TCP/UDP TPROXY, or ICMPv6 NFQUEUE, while local or
+special destinations outside those daemon-owned paths do not use the ACL as an
+admission gate.
 
 Process/session cleanup:
 
@@ -477,7 +639,9 @@ session rollback mechanism.
 
 External mutations:
 
-- repeatedly delete IPv6 policy rules at `<daemon-priority>`.
+- repeatedly delete IPv6 policy rules at the NAT66 daemon priority, including
+  protocol rules, fwmark fallback rules, and any interrupted detached probe
+  rule.
 - repeatedly delete IPv4 policy rules at `<primary-priority>`.
 - repeatedly delete IPv4 policy rules at `<fallback-priority>`.
 - repeatedly delete IPv4 policy rules at `<upstream-disable-priority>`.
@@ -498,19 +662,20 @@ nonfatal cleanup reports.
 External mutations:
 
 - repeatedly delete `iptables -t mangle PREROUTING -j vpnhotspot_dns_tproxy`.
+- repeatedly delete `iptables -t filter INPUT -j vpnhotspot_dns_input`.
 - repeatedly delete `iptables -t filter FORWARD -j vpnhotspot_acl`.
+- repeatedly delete `iptables -t nat PREROUTING -j vpnhotspot_dns_nat`.
 - repeatedly delete `iptables -t nat POSTROUTING -j vpnhotspot_masquerade`.
 - restore IPv4 mangle table input that flushes or creates
   `vpnhotspot_dns_tproxy`, then deletes it.
-- restore IPv4 filter table input that flushes or creates `vpnhotspot_acl` and
-  `vpnhotspot_stats`, then deletes them.
-- restore IPv4 nat table input that flushes `PREROUTING`, flushes or creates
-  `vpnhotspot_masquerade`, then deletes `vpnhotspot_masquerade`.
+- restore IPv4 filter table input that flushes or creates
+  `vpnhotspot_dns_input`, `vpnhotspot_acl`, and `vpnhotspot_stats`, then
+  deletes them.
+- restore IPv4 nat table input that flushes or creates `vpnhotspot_dns_nat`
+  and `vpnhotspot_masquerade`, then deletes them.
 
 The IPv4 mangle `vpnhotspot_dns_tproxy` cleanup is legacy-shaped cleanup kept
-in Clean. The IPv4 nat `PREROUTING` flush is a broad external mutation and must
-be treated as part of Clean's current contract when changing DNS redirect
-cleanup.
+in Clean. IPv4 nat cleanup must stay scoped to app-owned jumps and chains.
 
 ### IPv6 Firewall Cleanup
 
@@ -573,8 +738,9 @@ it.
   memory for state that can outlive the process.
 - Do not install interception for a DNS or NAT66 runtime capability that failed
   to start.
+- Do not publish a per-MAC DNS or NAT66 capability unless both the daemon
+  resource and matching routing rule committed. Cancel staged resources whose
+  rules failed.
 - Do not disable netd NAT unless the daemon has an app-owned ownership token for
   the exact state being disabled.
-- Do not flush shared platform tables. When a broad flush exists, such as the
-  current IPv4 nat `PREROUTING` Clean step, keep it explicitly documented and
-  re-evaluate it before extending nearby behavior.
+- Do not flush shared platform tables or shared firewall base chains.

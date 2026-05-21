@@ -1,7 +1,8 @@
 use std::io;
 
-use crate::{firewall::IptablesTarget, netlink, report};
+use crate::{firewall::IptablesTarget, netlink, platform, report};
 use vpnhotspotd::shared::downstream::DownstreamIpv4;
+use vpnhotspotd::shared::ipv4_forward_counter::changed_ipv4_forward_counter_addresses;
 use vpnhotspotd::shared::model::{SessionConfig, SessionPorts};
 use vpnhotspotd::shared::proto::daemon::CleanRoutingCommand;
 
@@ -9,6 +10,8 @@ mod desired;
 mod firewall_cleanup;
 mod iptables;
 mod ipv6_nat_firewall;
+mod ipv6_nat_intercept;
+mod ipv6_nat_listener_rules;
 mod ndc;
 mod netlink_commands;
 mod static_addresses;
@@ -17,6 +20,7 @@ use iptables::{
     apply_iptables_batch, ensure_iptables_chain, ensure_iptables_chain_result, IptablesRule,
 };
 use ipv6_nat_firewall::Ipv6NatFirewall;
+use ipv6_nat_intercept::Ipv6NatInterceptMode;
 use ndc::{add_ip_forward, remove_ip_forward, run_ndc};
 use netlink_commands::{delete_rule_repeated, IpCommand, IpFamily};
 use static_addresses::clean_ip;
@@ -98,27 +102,33 @@ impl RoutingMutation {
 }
 
 pub(crate) struct Runtime {
+    call_id: u64,
     ports: SessionPorts,
     downstream_ipv4: DownstreamIpv4,
+    ipv6_nat_intercept_mode: Option<Ipv6NatInterceptMode>,
     netlink: netlink::Handle,
     applied: Vec<RoutingMutation>,
 }
 
 impl Runtime {
     pub(crate) async fn start(
+        call_id: u64,
         config: &SessionConfig,
         downstream_ipv4: DownstreamIpv4,
         ports: SessionPorts,
         netlink: netlink::Handle,
-    ) -> Self {
+    ) -> (Self, SessionPorts) {
         let mut runtime = Self {
+            call_id,
             ports,
             downstream_ipv4,
+            ipv6_nat_intercept_mode: None,
             netlink,
             applied: Vec::new(),
         };
         runtime.setup(config).await;
-        runtime
+        let committed = runtime.reconcile_committed_ports(config).await;
+        (runtime, committed)
     }
 
     pub(crate) async fn replace(
@@ -126,7 +136,8 @@ impl Runtime {
         previous: &SessionConfig,
         next: &SessionConfig,
         downstream_ipv4: DownstreamIpv4,
-    ) -> io::Result<()> {
+        ports: SessionPorts,
+    ) -> io::Result<SessionPorts> {
         if previous.downstream != next.downstream {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -134,9 +145,11 @@ impl Runtime {
             ));
         }
         self.downstream_ipv4 = downstream_ipv4;
+        self.ports = ports;
+        self.reset_changed_ipv4_counter_rules(previous, next).await;
         let desired = self.desired_mutations(next).await;
         self.reconcile(desired).await;
-        Ok(())
+        Ok(self.reconcile_committed_ports(next).await)
     }
 
     pub(crate) async fn stop(mut self) {
@@ -146,6 +159,40 @@ impl Runtime {
     async fn setup(&mut self, config: &SessionConfig) {
         let desired = self.desired_mutations(config).await;
         self.reconcile(desired).await;
+    }
+
+    async fn reconcile_committed_ports(&mut self, config: &SessionConfig) -> SessionPorts {
+        let committed = self.committed_ports(config);
+        self.ports = committed.clone();
+        let desired = self.desired_mutations(config).await;
+        self.reconcile(desired).await;
+        committed
+    }
+
+    async fn reset_changed_ipv4_counter_rules(
+        &mut self,
+        previous: &SessionConfig,
+        next: &SessionConfig,
+    ) {
+        for address in changed_ipv4_forward_counter_addresses(&previous.clients, &next.clients) {
+            let Some(client) = previous
+                .clients
+                .iter()
+                .find(|client| client.ipv4.contains(&address))
+            else {
+                continue;
+            };
+            for rule in Self::client_ip_stats_rules(previous, client.mac, address) {
+                let mutation = RoutingMutation::Iptables(rule);
+                let mut index = self.applied.len();
+                while index > 0 {
+                    index -= 1;
+                    if self.applied[index] == mutation && mutation.delete(&self.netlink).await {
+                        self.applied.remove(index);
+                    }
+                }
+            }
+        }
     }
 
     async fn reconcile(&mut self, desired: Vec<RoutingMutation>) {
@@ -247,16 +294,9 @@ fn push_unique(mutations: &mut Vec<RoutingMutation>, mutation: RoutingMutation) 
 }
 
 fn rule_priority(base: u32) -> u32 {
-    rule_priority_for_api(base, android_api_level())
+    rule_priority_for_api(base, platform::android_api_level())
 }
 
 fn rule_priority_for_api(base: u32, api_level: i32) -> u32 {
     (base as i32 + if api_level < 31 { -3000 } else { 0 }) as u32
-}
-
-fn android_api_level() -> i32 {
-    extern "C" {
-        fn android_get_device_api_level() -> libc::c_int;
-    }
-    unsafe { android_get_device_api_level() as i32 }
 }

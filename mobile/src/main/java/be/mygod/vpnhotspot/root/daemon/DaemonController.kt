@@ -74,7 +74,7 @@ object DaemonController {
         listOf(if (Process.is64Bit()) "/system/bin/linker64" else "/system/bin/linker", path)
     }
 
-    class SessionCall(val id: Long, val closed: Flow<Unit>) {
+    class SessionCall(val id: Long, val events: Flow<EventFrame>) {
         suspend fun close() = closeEventCall(id)
     }
 
@@ -93,20 +93,16 @@ object DaemonController {
             withContext(NonCancellable) { closeEventCall(call.id) }
             throw e
         }
-        return SessionCall(call.id, flow {
-            eventFlow(call, cancelOnClose = false).collect { event ->
-                throw IOException("Unexpected $BINARY_NAME session event $event")
-            }
-        })
+        return SessionCall(call.id, eventFlow(call, cancelOnClose = false))
     }
 
     suspend fun replaceSession(sessionId: Long, config: SessionConfig) {
         request(ClientEnvelope(replace_session = ReplaceSessionCommand(sessionId, config))).requireAck()
     }
 
-    suspend fun readTrafficCounterLines(): List<String> {
+    suspend fun readTrafficCounters(): List<TrafficCounter> {
         val reply = request(ClientEnvelope(read_traffic_counters = ReadTrafficCountersCommand()))
-        return reply.traffic_counter_lines?.lines ?: throw IOException("Unexpected daemon reply $reply")
+        return reply.traffic_counters?.counters ?: throw IOException("Unexpected daemon reply $reply")
     }
 
     fun neighbourMonitor(): Flow<NeighbourMonitorUpdate> = flow {
@@ -163,13 +159,34 @@ object DaemonController {
                         stderr = null
                     }
                 }
-                withTimeoutOrNull(10.seconds) { serverSocket.accept() }.also {
-                    socket = it ?: throw IOException("Timed out waiting for $BINARY_NAME to connect")
-                    input = it.openReadChannel()
-                    output = it.openWriteChannel()
-                    startReaderLocked(input!!)
-                    Timber.d("Started $BINARY_NAME")
+                var acceptedDaemon: ALocalSocket? = null
+                withTimeoutOrNull(10.seconds) {
+                    while (acceptedDaemon == null) {
+                        val accepted = serverSocket.accept()
+                        var acceptedByDaemon = false
+                        try {
+                            val uid = accepted.socket.peerCredentials.uid
+                            if (uid == 0) {
+                                acceptedByDaemon = true
+                                acceptedDaemon = accepted
+                            } else Timber.w("Rejected $BINARY_NAME connection from uid=$uid")
+                        } finally {
+                            if (!acceptedByDaemon) try {
+                                accepted.close()
+                            } catch (e: IOException) {
+                                Timber.w(e, "Failed to close rejected $BINARY_NAME connection")
+                            }
+                        }
+                    }
                 }
+                val daemonSocket = acceptedDaemon ?: throw IOException(
+                    "Timed out waiting for root $BINARY_NAME to connect",
+                )
+                socket = daemonSocket
+                input = daemonSocket.openReadChannel()
+                output = daemonSocket.openWriteChannel()
+                startReaderLocked(input!!)
+                Timber.d("Started $BINARY_NAME")
             }
         } catch (e: Exception) {
             try {

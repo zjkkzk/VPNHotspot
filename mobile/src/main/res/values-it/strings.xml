@@ -63,6 +63,7 @@
     <string name="connected_state_failed">" (perso)"</string>
 
     <string name="clients_popup_nickname">Nickname…</string>
+    <string name="clients_nickname_hint">Nickname</string>
     <string name="clients_popup_block">Blocca</string>
     <string name="clients_popup_block_service_inactive">Questo client verrà bloccato quando il servizio per questa interfaccia sarà attivato.</string>
     <string name="clients_popup_unblock">Sblocca</string>
@@ -71,20 +72,15 @@
     <string name="clients_nickname_title">Nickname per %s</string>
     <string name="clients_nickname_set_to_vendor">← 🏳️‍🌈 Venditore</string>
     <string name="clients_stats_title">Statistiche per ^1</string>
-    <plurals name="clients_stats_message_1">
-        <item quantity="one">Connesso 1 volta dal %2$s</item>
-        <item quantity="many">Connesso %1$s di volte dal %2$s</item>
-        <item quantity="other">Connesso %1$s volte dal %2$s</item>
-    </plurals>
     <plurals name="clients_stats_message_2">
-        <item quantity="one">Inviato 1 pacchetto, %2$s</item>
-        <item quantity="many">Inviati %1$s di pacchetti, %2$s</item>
-        <item quantity="other">Inviati %1$s pacchetti, %2$s</item>
+        <item quantity="one">\nInviato 1 pacchetto, ^2</item>
+        <item quantity="many">\nInviati ^1 di pacchetti, ^2</item>
+        <item quantity="other">\nInviati ^1 pacchetti, ^2</item>
     </plurals>
     <plurals name="clients_stats_message_3">
-        <item quantity="one">Ricevuto 1 pacchetto, %2$s</item>
-        <item quantity="many">Ricevuti %1$s di pacchetti, %2$s</item>
-        <item quantity="other">Ricevuti %1$s pacchetti, %2$s</item>
+        <item quantity="one">\nRicevuto 1 pacchetto, ^2</item>
+        <item quantity="many">\nRicevuti ^1 di pacchetti, ^2</item>
+        <item quantity="other">\nRicevuti ^1 pacchetti, ^2</item>
     </plurals>
 
     <string name="settings_upstream">Upstream</string>
@@ -137,7 +133,6 @@
     </plurals>
 
     <string name="failure_reason_unknown">sconosciuta #%d</string>
-    <string name="noisy_su_failure">Qualcosa è andato storto, per favore controlla le informazioni di debug.</string>
 
     <string name="configuration_view">Configurazione Wi\u2011Fi</string>
     <string name="configuration_share">Condividi con Codice QR</string>

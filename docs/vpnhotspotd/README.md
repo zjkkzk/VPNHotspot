@@ -22,10 +22,17 @@ IPC documentations not included and should refer to [`mobile/src/main/proto/daem
   NAT proxy runtimes and helper protocol state.
 - [`dns.rs`](../../mobile/src/main/rust/vpnhotspotd/src/dns.rs) owns the daemon
   DNS listeners and Android resolver handoff.
+- [`traffic.rs`](../../mobile/src/main/rust/vpnhotspotd/src/traffic.rs) owns
+  daemon traffic-counter reads and the daemon-to-Kotlin counter reporting
+  boundary.
 - [`netlink.rs`](../../mobile/src/main/rust/vpnhotspotd/src/netlink.rs) owns the
   shared rtnetlink connection, notifications, and single-consumer event slots.
 - [`neighbour.rs`](../../mobile/src/main/rust/vpnhotspotd/src/neighbour.rs)
   converts netlink neighbour and bridge topology state into daemon events.
+- [`ipsec.rs`](../../mobile/src/main/rust/vpnhotspotd/src/ipsec.rs) owns the
+  optional Android 12+ IPsec forwarding-policy probe and emits session events
+  for the Kotlin routing owner to perform the hidden Netd write only when
+  needed.
 - [`report.rs`](../../mobile/src/main/rust/vpnhotspotd/src/report.rs) and
   [`shared/protocol.rs`](../../mobile/src/main/rust/vpnhotspotd/src/shared/protocol.rs)
   build structured daemon reports.
@@ -45,6 +52,8 @@ daemon reports into app-visible exceptions or nonfatal warnings.
   router advertisements, marks, and cleanup.
 - [`dns.md`](dns.md): DNS listener ownership, resolver handoff, config snapshot
   semantics, and nonblocking assumptions.
+- [`traffic.md`](traffic.md): MAC-facing traffic accounting, blocking scope,
+  counter sources, recorder chain boundaries, and persistence mapping.
 - [`errors.md`](errors.md): terminal errors, nonfatal reports, context/detail
   requirements, and background-task failure policy.
 - [`invariants.md`](invariants.md): cross-module ownership, interception,
