@@ -64,6 +64,8 @@ data class SoftApConfigurationCompat(
     var allowedAcsChannels: Map<Int, Set<Int>> = emptyMap(),
     @TargetApi(33)
     var maxChannelBandwidth: Int = CHANNEL_WIDTH_AUTO,
+    @RequiresApi(35)
+    var vendorData: List<OuiKeyedData> = emptyList(),
     @RequiresApi(36)
     var isClientIsolationEnabled: Boolean = false,
     @RequiresApi(30)
@@ -110,15 +112,6 @@ data class SoftApConfigurationCompat(
          * [android.net.wifi.WifiConfiguration.KeyMgmt.WPA2_PSK]
          */
         private const val LEGACY_WPA2_PSK = 4
-
-        val securityTypes = arrayOf(
-            "OPEN",
-            "WPA2-PSK",
-            "WPA3-SAE Transition mode",
-            "WPA3-SAE",
-            "WPA3-OWE Transition",
-            "WPA3-OWE",
-        )
 
         /**
          * Based on:
@@ -314,6 +307,10 @@ data class SoftApConfigurationCompat(
             SoftApConfiguration.Builder::class.java.getDeclaredMethod(
                 "setBridgedModeOpportunisticShutdownTimeoutMillis", Long::class.java)
         }
+        @get:RequiresApi(35)
+        private val getVendorData by lazy @TargetApi(35) {
+            SoftApConfiguration::class.java.getDeclaredMethod("getVendorData")
+        }
         @get:RequiresApi(30)
         private val setChannel by lazy @TargetApi(30) {
             SoftApConfiguration.Builder::class.java.getDeclaredMethod("setChannel", Int::class.java, Int::class.java)
@@ -366,6 +363,10 @@ data class SoftApConfigurationCompat(
         @get:RequiresApi(33)
         private val setVendorElements by lazy @TargetApi(33) {
             SoftApConfiguration.Builder::class.java.getDeclaredMethod("setVendorElements", List::class.java)
+        }
+        @get:RequiresApi(35)
+        private val setVendorData by lazy @TargetApi(35) {
+            SoftApConfiguration.Builder::class.java.getDeclaredMethod("setVendorData", List::class.java)
         }
 
         @Deprecated("Class deprecated in framework")
@@ -450,6 +451,8 @@ data class SoftApConfigurationCompat(
                 }
             }.filterNotNull().toMap()
             it.maxChannelBandwidth = getMaxChannelBandwidth(this) as Int
+            if (Build.VERSION.SDK_INT < 35) return@also
+            it.vendorData = (getVendorData(this) as List<Parcelable>).map(::OuiKeyedData)
             if (Build.VERSION.SDK_INT >= 36) it.isClientIsolationEnabled = isClientIsolationEnabled(this) as Boolean
         }
 
@@ -607,7 +610,10 @@ data class SoftApConfigurationCompat(
                     }
                 }
                 setMaxChannelBandwidth(builder, maxChannelBandwidth)
-                if (Build.VERSION.SDK_INT >= 36) setClientIsolationEnabled(builder, isClientIsolationEnabled)
+                if (Build.VERSION.SDK_INT >= 35) {
+                    setVendorData(builder, vendorData.map { it.inner })
+                    if (Build.VERSION.SDK_INT >= 36) setClientIsolationEnabled(builder, isClientIsolationEnabled)
+                }
             }
         }
         return builder.build()
