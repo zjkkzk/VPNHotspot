@@ -5,12 +5,12 @@ use std::sync::Arc;
 
 use prost::Message;
 use tokio::select;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::neighbour::Monitor;
+use crate::report::{ControllerSender, ControllerSenderExt};
 use crate::session::Session;
 use crate::{ipsec, nat66, netlink, report, routing};
 use vpnhotspotd::shared::ipsec::{IpSecForwardPolicyTarget, UpstreamTracker};
@@ -95,7 +95,7 @@ pub(crate) async fn run(socket_name: String) -> io::Result<()> {
                     "control.parse_command",
                     io::Error::new(io::ErrorKind::InvalidData, "missing command"),
                 );
-                if sender.send(error_frame(id, report)).is_err() {
+                if !sender.send_frame(error_frame(id, report)) {
                     report::stderr!("controller send failed");
                     break;
                 }
@@ -114,7 +114,7 @@ pub(crate) async fn run(socket_name: String) -> io::Result<()> {
                     "AlreadyExists",
                     [("id", id.to_string())],
                 );
-                if sender.send(error_frame(id, report)).is_err() {
+                if !sender.send_frame(error_frame(id, report)) {
                     report::stderr!("controller send failed");
                     break;
                 }
@@ -140,6 +140,7 @@ pub(crate) async fn run(socket_name: String) -> io::Result<()> {
         }
     }
     state.stop(false).await;
+    report::flush().await;
     drop(sender);
     if let Err(e) = writer.await {
         report::stderr!("controller writer task failed: {e}");
@@ -159,6 +160,8 @@ struct State {
 struct SessionState {
     id: u64,
     downstream: String,
+    cancel: CancellationToken,
+    teardown_complete: CancellationToken,
     cleaning: AtomicBool,
     control: Mutex<Option<SessionControl>>,
 }
@@ -220,7 +223,7 @@ impl State {
         self: &Arc<Self>,
         slot: &Arc<SessionState>,
         config: &vpnhotspotd::shared::model::SessionConfig,
-        sender: &UnboundedSender<Vec<u8>>,
+        sender: &ControllerSender,
     ) {
         let entered = {
             let sessions = self.sessions.lock().await;
@@ -247,7 +250,7 @@ impl State {
         &self,
         interfaces: &[String],
         result: io::Result<Vec<IpSecForwardPolicyTarget>>,
-        sender: &UnboundedSender<Vec<u8>>,
+        sender: &ControllerSender,
     ) {
         match result {
             Ok(targets) => {
@@ -262,7 +265,7 @@ impl State {
                         .collect::<Vec<_>>()
                 };
                 for frame in frames {
-                    if sender.send(frame).is_err() {
+                    if !sender.send_frame(frame) {
                         report::stderr!("controller send failed");
                         return;
                     }
@@ -287,7 +290,7 @@ async fn handle_command(
     id: u64,
     command: daemon::client_envelope::Command,
     state: Arc<State>,
-    sender: &UnboundedSender<Vec<u8>>,
+    sender: &ControllerSender,
     active_calls: Arc<Mutex<HashMap<u64, Arc<CallState>>>>,
     cancel: CancellationToken,
 ) -> io::Result<CallOutput> {
@@ -404,22 +407,41 @@ async fn start_session(
     id: u64,
     state: &Arc<State>,
     mut config: vpnhotspotd::shared::model::SessionConfig,
-    sender: &UnboundedSender<Vec<u8>>,
+    sender: &ControllerSender,
     cancel: &CancellationToken,
 ) -> io::Result<()> {
     let downstream = config.downstream.clone();
     let slot = Arc::new(SessionState {
         id,
         downstream: downstream.clone(),
+        cancel: cancel.clone(),
+        teardown_complete: CancellationToken::new(),
         cleaning: AtomicBool::new(false),
         control: Mutex::new(None),
     });
-    {
-        let mut sessions = state.sessions.lock().await;
-        if sessions
-            .values()
-            .any(|session| session.downstream == downstream)
-        {
+    loop {
+        let existing = {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(existing) = sessions
+                .values()
+                .find(|session| session.downstream == downstream)
+                .cloned()
+            {
+                existing
+            } else {
+                sessions.insert(id, slot.clone());
+                break;
+            }
+        };
+        if existing.cancel.is_cancelled() {
+            select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    return Err(io::Error::new(io::ErrorKind::Interrupted, "start session cancelled"));
+                }
+                _ = existing.teardown_complete.cancelled() => {}
+            }
+        } else {
             return Err(
                 io::Error::new(io::ErrorKind::AlreadyExists, "session already exists")
                     .with_report_context_details(
@@ -428,7 +450,6 @@ async fn start_session(
                     ),
             );
         }
-        sessions.insert(id, slot.clone());
     }
     let netlink = match state
         .netlink()
@@ -479,7 +500,7 @@ async fn start_session(
     let (control, command_receiver) = session_control::channel();
     *guard = Some(control);
     drop(guard);
-    if sender.send(ack_event_frame(id)).is_err() {
+    if !sender.send_frame(ack_event_frame(id)) {
         *slot.control.lock().await = None;
         session.stop(false).await;
         remove_session_slot(state, &slot).await;
@@ -499,7 +520,7 @@ async fn replace_session(
     state: &Arc<State>,
     session_id: u64,
     config: vpnhotspotd::shared::model::SessionConfig,
-    sender: &UnboundedSender<Vec<u8>>,
+    sender: &ControllerSender,
 ) -> io::Result<()> {
     let slot = state
         .sessions
@@ -564,12 +585,13 @@ async fn remove_session_slot(state: &State, slot: &Arc<SessionState>) {
         drop(sessions);
         state.ipsec.lock().await.remove_session(slot.id);
     }
+    slot.teardown_complete.cancel();
 }
 
 async fn start_neighbour_monitor(
     id: u64,
     state: &State,
-    sender: UnboundedSender<Vec<u8>>,
+    sender: ControllerSender,
     cancel: CancellationToken,
 ) -> io::Result<()> {
     let mut current = state.neighbour_monitor.lock().await;
