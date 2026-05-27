@@ -6,13 +6,18 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.ConnectivityManager
+import android.net.IIntResultListener
+import android.net.ITetheringConnector
 import android.net.Network
+import android.net.TetheredClient
 import android.net.TetheringInterface
 import android.net.TetheringManager
+import android.net.`ConnectivityManager$OnStartTetheringCallback`
+import android.net.`TetheringManager$TetheringInterfaceRegexps`
 import android.os.Build
 import android.os.DeadObjectException
 import android.os.Handler
-import android.os.Parcelable
+import androidx.annotation.Keep
 import androidx.annotation.RequiresApi
 import androidx.core.os.ExecutorCompat
 import be.mygod.vpnhotspot.App.Companion.app
@@ -27,13 +32,10 @@ import be.mygod.vpnhotspot.util.UnblockCentral
 import be.mygod.vpnhotspot.util.callSuper
 import be.mygod.vpnhotspot.util.getRootCause
 import be.mygod.vpnhotspot.util.matches
-import be.mygod.vpnhotspot.util.matches1
-import com.android.dx.stock.ProxyBuilder
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.launch
 import timber.log.Timber
-import java.io.File
 import java.lang.ref.WeakReference
 import java.lang.reflect.InvocationHandler
 import java.lang.reflect.InvocationTargetException
@@ -142,12 +144,9 @@ object TetheringManagerCompat {
         }
     }.first()
 
-    private val classOnStartTetheringCallback by lazy {
-        Class.forName("android.net.ConnectivityManager\$OnStartTetheringCallback")
-    }
     private val startTethering by lazy {
-        ConnectivityManager::class.java.getDeclaredMethod("startTethering",
-                Int::class.java, Boolean::class.java, classOnStartTetheringCallback, Handler::class.java)
+        ConnectivityManager::class.java.getDeclaredMethod("startTethering", Int::class.java, Boolean::class.java,
+            `ConnectivityManager$OnStartTetheringCallback`::class.java, Handler::class.java)
     }
     private val stopTethering by lazy {
         ConnectivityManager::class.java.getDeclaredMethod("stopTethering", Int::class.java)
@@ -155,6 +154,7 @@ object TetheringManagerCompat {
     private val getLastTetherError by lazy @SuppressLint("SoonBlockedPrivateApi") {
         ConnectivityManager::class.java.getDeclaredMethod("getLastTetherError", String::class.java)
     }
+    private var stopTetheringHasAttributionTag = true
 
 //    @get:RequiresApi(30)
 //    private val setStaticIpv4Addresses by lazy {
@@ -174,19 +174,16 @@ object TetheringManagerCompat {
 
     @Deprecated("Legacy API")
     fun startTetheringLegacy(type: Int, showProvisioningUi: Boolean, callback: StartTetheringCallback,
-                             handler: Handler? = null, cacheDir: File = app.deviceStorage.codeCacheDir) {
+                             handler: Handler? = null) {
         val reference = WeakReference(callback)
-        val proxy = ProxyBuilder.forClass(classOnStartTetheringCallback).apply {
-            dexCache(cacheDir)
-            handler { proxy, method, args ->
-                val callback = reference.get()
-                if (args.isEmpty()) when (method.name) {
-                    "onTetheringStarted" -> return@handler callback?.onTetheringStarted()
-                    "onTetheringFailed" -> return@handler callback?.onTetheringFailed()
-                }
-                ProxyBuilder.callSuper(proxy, method, *args)
+        val proxy = object : `ConnectivityManager$OnStartTetheringCallback`() {
+            override fun onTetheringStarted() {
+                reference.get()?.onTetheringStarted()
             }
-        }.build()
+            override fun onTetheringFailed() {
+                reference.get()?.onTetheringFailed()
+            }
+        }
         startTethering(Services.connectivity, type, showProvisioningUi, proxy, handler)
     }
     @RequiresApi(30)
@@ -199,8 +196,7 @@ object TetheringManagerCompat {
         }.build(), executor, callback)
     }
     @RequiresApi(30)
-    private fun proxy(callback: StartTetheringCallback): TetheringManager.StartTetheringCallback {
-        val reference = WeakReference(callback)
+    private fun proxy(reference: WeakReference<StartTetheringCallback>): TetheringManager.StartTetheringCallback {
         return object : TetheringManager.StartTetheringCallback {
             override fun onTetheringStarted() {
                 reference.get()?.onTetheringStarted()
@@ -234,54 +230,54 @@ object TetheringManagerCompat {
      * *@see setStaticIpv4Addresses
      */
     fun startTethering(type: Int, showProvisioningUi: Boolean, callback: StartTetheringCallback,
-                       handler: Handler? = null, cacheDir: File = app.deviceStorage.codeCacheDir) {
+                       handler: Handler? = null) {
         if (Build.VERSION.SDK_INT >= 30) try {
             val executor = if (handler == null) InPlaceExecutor else ExecutorCompat.create(handler)
-            startTethering(type, true, showProvisioningUi,
-                    executor, proxy(object : StartTetheringCallback {
-                override fun onTetheringStarted() = callback.onTetheringStarted()
-                override fun onTetheringFailed(error: Int?) {
+            val reference = WeakReference(callback)
+            startTethering(type, true, showProvisioningUi, executor, object : TetheringManager.StartTetheringCallback {
+                override fun onTetheringStarted() {
+                    reference.get()?.onTetheringStarted()
+                }
+                override fun onTetheringFailed(error: Int) {
                     if (error != TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION) {
-                        callback.onTetheringFailed(error)
-                    } else GlobalScope.launch(Dispatchers.Unconfined) {
-                        val result = try {
-                            RootManager.use { it.execute(StartTethering(type, showProvisioningUi)) }
-                        } catch (eRoot: Exception) {
-                            try {   // last resort: start tethering without trying to bypass entitlement check
-                                startTethering(type, false, showProvisioningUi, executor, proxy(callback))
-                                if (eRoot !is CancellationException) Timber.w(eRoot)
-                            } catch (e: Exception) {
-                                e.addSuppressed(eRoot)
-                                callback.onException(e)
+                        reference.get()?.onTetheringFailed(error)
+                    } else {
+                        val currentCallback = reference.get() ?: return
+                        GlobalScope.launch(Dispatchers.Unconfined) {
+                            val result = try {
+                                RootManager.use { it.execute(StartTethering(type, showProvisioningUi)) }
+                            } catch (eRoot: Exception) {
+                                try {   // last resort: start tethering without trying to bypass entitlement check
+                                    startTethering(type, false, showProvisioningUi, executor, proxy(reference))
+                                    if (eRoot !is CancellationException) Timber.w(eRoot)
+                                } catch (e: Exception) {
+                                    e.addSuppressed(eRoot)
+                                    currentCallback.onException(e)
+                                }
+                                return@launch
                             }
-                            return@launch
-                        }
-                        when {
-                            result == null -> callback.onTetheringStarted()
-                            result.value == TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION -> try {
-                                startTethering(type, false, showProvisioningUi, executor, proxy(callback))
-                            } catch (e: Exception) {
-                                callback.onException(e)
+                            when {
+                                result == null -> currentCallback.onTetheringStarted()
+                                result.value == TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION -> try {
+                                    startTethering(type, false, showProvisioningUi, executor, proxy(reference))
+                                } catch (e: Exception) {
+                                    currentCallback.onException(e)
+                                }
+                                else -> currentCallback.onTetheringFailed(result.value)
                             }
-                            else -> callback.onTetheringFailed(result.value)
                         }
                     }
                 }
-                override fun onException(e: Exception) = callback.onException(e)
-            }))
+            })
         } catch (e: Exception) {
             callback.onException(e)
         } else @Suppress("DEPRECATION") try {
-            startTetheringLegacy(type, showProvisioningUi, callback, handler, cacheDir)
+            startTetheringLegacy(type, showProvisioningUi, callback, handler)
         } catch (e: InvocationTargetException) {
             if (e.targetException is SecurityException) GlobalScope.launch(Dispatchers.Unconfined) {
                 val result = try {
-                    val rootCache = File(cacheDir, "root")
-                    rootCache.mkdirs()
-                    check(rootCache.exists()) { "Creating root cache dir failed" }
                     RootManager.use {
-                        it.execute(be.mygod.vpnhotspot.root.StartTetheringLegacy(
-                                rootCache, type, showProvisioningUi))
+                        it.execute(be.mygod.vpnhotspot.root.StartTetheringLegacy(type, showProvisioningUi))
                     }.value
                 } catch (eRoot: Exception) {
                     eRoot.addSuppressed(e)
@@ -296,45 +292,45 @@ object TetheringManagerCompat {
         }
     }
 
-    private val stubIIntResultListener by lazy { Class.forName("android.net.IIntResultListener\$Stub") }
     @RequiresApi(30)
-    fun stopTethering(type: Int, callback: StopTetheringCallback, context: Context,
-                      cacheDir: File = app.deviceStorage.codeCacheDir) {
+    fun stopTethering(type: Int, callback: StopTetheringCallback, context: Context) {
         val reference = WeakReference(callback)
         val contextRef = WeakReference(context)
-        UnblockCentral.TetheringManager_getConnector(Services.tethering, Proxy.newProxyInstance(
-            UnblockCentral.TetheringManager_ConnectorConsumer.classLoader,
-            arrayOf(UnblockCentral.TetheringManager_ConnectorConsumer), object : InvocationHandler {
+        val handler = object : InvocationHandler {
             override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?) = when {
-                method.matches("onConnectorAvailable", UnblockCentral.ITetheringConnector) -> {
+                method.matches("onConnectorAvailable", ITetheringConnector::class.java) -> {
+                    val connector = args!![0] as ITetheringConnector
                     contextRef.get()?.let { context ->
-                        val resultListener = ProxyBuilder.forClass(stubIIntResultListener).apply {
-                            dexCache(cacheDir)
-                            handler { proxy, method, args ->
+                        val resultListener = object : IIntResultListener.Stub() {
+                            override fun onResult(resultCode: Int) {
                                 val callback = reference.get()
-                                if (method.name == "onResult") (args[0] as Int).let { resultCode ->
-                                    return@handler if (resultCode == TetheringManager.TETHER_ERROR_NO_ERROR) {
-                                        callback?.onStopTetheringSucceeded()
-                                    } else callback?.onStopTetheringFailed(resultCode)
-                                }
-                                ProxyBuilder.callSuper(proxy, method, *args)
+                                if (resultCode == TetheringManager.TETHER_ERROR_NO_ERROR) {
+                                    callback?.onStopTetheringSucceeded()
+                                } else callback?.onStopTetheringFailed(resultCode)
                             }
-                        }.build()
-                        val (method, isNew) = UnblockCentral.ITetheringConnector_stopTethering
-                        if (isNew) {
-                            method(args!![0], type, context.opPackageName, context.attributionTag,
+                        }
+                        if (stopTetheringHasAttributionTag) try {
+                            connector.stopTethering(type, context.opPackageName, context.attributionTag,
                                 resultListener)
-                        } else method(args!![0], type, context.opPackageName, resultListener)
+                            return@let
+                        } catch (e: NoSuchMethodError) {
+                            if (Build.VERSION.SDK_INT >= 31) Timber.w(e)
+                            stopTetheringHasAttributionTag = false
+                        }
+                        connector.stopTethering(type, context.opPackageName, resultListener)
                     }
                 }
-                else -> callSuper(UnblockCentral.TetheringManager_ConnectorConsumer::class.java, proxy, method, args)
+                else -> callSuper(UnblockCentral.TetheringManager_ConnectorConsumer, proxy, method, args)
             }
-        }))
+        }
+        UnblockCentral.TetheringManager_getConnector(Services.tethering, Proxy.newProxyInstance(
+            UnblockCentral.TetheringManager_ConnectorConsumer.classLoader,
+            arrayOf(UnblockCentral.TetheringManager_ConnectorConsumer), handler))
     }
-    private fun stopTetheringRoot(type: Int, callback: StopTetheringCallback, cacheDir: File,
+    private fun stopTetheringRoot(type: Int, callback: StopTetheringCallback,
                                   suppressed: Exception? = null) = GlobalScope.launch(Dispatchers.Unconfined) {
         val result = try {
-            RootManager.use { it.execute(StopTethering(cacheDir, type)) }
+            RootManager.use { it.execute(StopTethering(type)) }
         } catch (eRoot: Exception) {
             stopTetheringLegacy(type, callback, if (eRoot is CancellationException) suppressed else eRoot.apply {
                 if (suppressed != null) addSuppressed(suppressed)
@@ -347,18 +343,18 @@ object TetheringManagerCompat {
             stopTetheringLegacy(type, callback, suppressed)
         }
     }
-    fun stopTethering(type: Int, callback: StopTetheringCallback, cacheDir: File = app.deviceStorage.codeCacheDir) {
+    fun stopTethering(type: Int, callback: StopTetheringCallback) {
         if (Build.VERSION.SDK_INT >= 30) try {
             stopTethering(type, object : StopTetheringCallback {
                 override fun onStopTetheringSucceeded() = callback.onStopTetheringSucceeded()
                 override fun onStopTetheringFailed(error: Int) {
                     if (error != TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION) {
                         callback.onStopTetheringFailed(error)
-                    } else stopTetheringRoot(type, callback, cacheDir)
+                    } else stopTetheringRoot(type, callback)
                 }
-            }, app, cacheDir)
+            }, app)
         } catch (e: Exception) {
-            stopTetheringRoot(type, callback, cacheDir, e)
+            stopTetheringRoot(type, callback, e)
         } else stopTetheringLegacy(type, callback)
     }
     fun stopTetheringLegacy(type: Int) = stopTethering(Services.connectivity, type)
@@ -493,7 +489,7 @@ object TetheringManagerCompat {
          * Only called if having permission one of NETWORK_SETTINGS, MAINLINE_NETWORK_STACK, NETWORK_STACK.
          * @param clients The new set of tethered clients; the collection is not ordered.
          */
-        fun onClientsChanged(clients: Collection<Parcelable>) {
+        fun onClientsChanged(clients: Collection<TetheredClient>) {
             if (clients.isNotEmpty()) Timber.i("onClientsChanged: ${clients.joinToString()}")
         }
 
@@ -509,11 +505,11 @@ object TetheringManagerCompat {
     private val tetheringInterfaces = ConcurrentHashMap<String, Int>()
     fun getInterfaceType(iface: String) = tetheringInterfaces[iface]
     @RequiresApi(30)
-    private fun toInterfaceCompat(arg: Any?): String = (arg as TetheringInterface).let {
+    private fun toInterfaceCompat(arg: Any?) = (arg as TetheringInterface).let {
         it.`interface`.also { iface -> tetheringInterfaces[iface] = it.type }
     }
     @RequiresApi(30)
-    private fun toInterfacesCompat(args: Array<out Any?>?) = (args!![0] as Set<*>).map(this::toInterfaceCompat)
+    private fun toInterfacesCompat(interfaces: Set<TetheringInterface>) = interfaces.map(this::toInterfaceCompat)
 
     private val callbackMap = mutableMapOf<TetheringEventCallback, TetheringManager.TetheringEventCallback>()
     /**
@@ -531,74 +527,82 @@ object TetheringManagerCompat {
     @RequiresApi(30)
     fun registerTetheringEventCallback(callback: TetheringEventCallback, executor: Executor? = null) {
         val reference = WeakReference(callback)
-        val proxy = synchronized(callbackMap) {
+        val platformCallback = synchronized(callbackMap) {
             var computed = false
             callbackMap.computeIfAbsent(callback) {
                 computed = true
-                Proxy.newProxyInstance(TetheringManager.TetheringEventCallback::class.java.classLoader,
-                        arrayOf(TetheringManager.TetheringEventCallback::class.java), object : InvocationHandler {
-                    override fun invoke(proxy: Any, method: Method, args: Array<out Any?>?): Any? {
-                        val callback = reference.get()
-                        return when {
-                            method.matches("onTetheringSupported", Boolean::class.java) -> {
-                                callback?.onTetheringSupported(args!![0] as Boolean)
-                            }
-                            method.matches1<java.util.Set<*>>("onSupportedTetheringTypes") -> {
-                                @Suppress("UNCHECKED_CAST")
-                                callback?.onSupportedTetheringTypes(args!![0] as Set<Int?>)
-                            }
-                            method.matches1<Network>("onUpstreamChanged") -> {
-                                callback?.onUpstreamChanged(args!![0] as Network?)
-                            }
-                            method.name == "onTetherableInterfaceRegexpsChanged" &&
-                                    method.parameters.singleOrNull()?.type?.name ==
-                                    "android.net.TetheringManager\$TetheringInterfaceRegexps" -> {
-                                callback?.onTetherableInterfaceRegexpsChanged(args!!.single())
-                            }
-                            method.matches1<java.util.List<*>>("onTetherableInterfacesChanged") -> {
-                                @Suppress("UNCHECKED_CAST")
-                                callback?.onTetherableInterfacesChanged(args!![0] as List<String?>)
-                            }
-                            method.matches1<java.util.Set<*>>("onTetherableInterfacesChanged") -> {
-                                callback?.onTetherableInterfacesChanged(toInterfacesCompat(args))
-                            }
-                            method.matches1<java.util.List<*>>("onTetheredInterfacesChanged") -> {
-                                @Suppress("UNCHECKED_CAST")
-                                callback?.onTetheredInterfacesChanged(args!![0] as List<String?>)
-                            }
-                            method.matches1<java.util.Set<*>>("onTetheredInterfacesChanged") -> {
-                                callback?.onTetheredInterfacesChanged(toInterfacesCompat(args))
-                            }
-                            method.matches1<java.util.List<*>>("onLocalOnlyInterfacesChanged") -> {
-                                @Suppress("UNCHECKED_CAST")
-                                callback?.onLocalOnlyInterfacesChanged(args!![0] as List<String?>)
-                            }
-                            method.matches1<java.util.Set<*>>("onLocalOnlyInterfacesChanged") -> {
-                                callback?.onLocalOnlyInterfacesChanged(toInterfacesCompat(args))
-                            }
-                            // workaround for API 30 which might be missing this class
-                            method.name == "onError" && method.parameterTypes.size == 2 &&
-                                    method.parameterTypes[0].name == "android.net.TetheringInterface" &&
-                                    method.parameterTypes[1] == Integer.TYPE -> {
-                                callback?.onError(toInterfaceCompat(args!![0] ?: return null), args[1] as Int)
-                            }
-                            method.matches("onError", String::class.java, Integer.TYPE) -> {
-                                callback?.onError(args!![0] as String, args[1] as Int)
-                            }
-                            method.matches1<java.util.Collection<*>>("onClientsChanged") -> {
-                                @Suppress("UNCHECKED_CAST")
-                                callback?.onClientsChanged(args!![0] as Collection<Parcelable>)
-                            }
-                            method.matches("onOffloadStatusChanged", Integer.TYPE) -> {
-                                callback?.onOffloadStatusChanged(args!![0] as Int)
-                            }
-                            else -> callSuper(TetheringManager.TetheringEventCallback::class.java, proxy, method, args)
+                @Keep
+                open class LegacyCallback : TetheringManager.TetheringEventCallback {
+                    fun onTetheringSupported(supported: Boolean) {
+                        reference.get()?.onTetheringSupported(supported)
+                    }
+
+                    fun onSupportedTetheringTypes(supportedTypes: Set<Int?>) {
+                        reference.get()?.onSupportedTetheringTypes(supportedTypes)
+                    }
+
+                    fun onUpstreamChanged(network: Network?) {
+                        reference.get()?.onUpstreamChanged(network)
+                    }
+
+                    fun onTetherableInterfaceRegexpsChanged(reg: `TetheringManager$TetheringInterfaceRegexps`) {
+                        reference.get()?.onTetherableInterfaceRegexpsChanged(reg)
+                    }
+
+                    fun onTetherableInterfacesChanged(interfaces: List<String?>) {
+                        reference.get()?.onTetherableInterfacesChanged(interfaces)
+                    }
+
+                    fun onTetheredInterfacesChanged(interfaces: List<String?>) {
+                        reference.get()?.onTetheredInterfacesChanged(interfaces)
+                    }
+
+                    fun onLocalOnlyInterfacesChanged(interfaces: List<String?>) {
+                        reference.get()?.onLocalOnlyInterfacesChanged(interfaces)
+                    }
+
+                    fun onError(ifName: String, error: Int) {
+                        reference.get()?.onError(ifName, error)
+                    }
+
+                    fun onClientsChanged(clients: Collection<TetheredClient>) {
+                        reference.get()?.onClientsChanged(clients)
+                    }
+
+                    fun onOffloadStatusChanged(status: Int) {
+                        reference.get()?.onOffloadStatusChanged(status)
+                    }
+                }
+                try {
+                    @Suppress("UNUSED_VARIABLE", "unused")
+                    val clazz = TetheringInterface::class.java
+                    object : LegacyCallback() {
+                        @Keep
+                        fun onTetherableInterfacesChanged(interfaces: Set<TetheringInterface>) {
+                            reference.get()?.onTetherableInterfacesChanged(toInterfacesCompat(interfaces))
+                        }
+
+                        override fun onTetheredInterfacesChanged(interfaces: Set<TetheringInterface>) {
+                            reference.get()?.onTetheredInterfacesChanged(toInterfacesCompat(interfaces))
+                        }
+
+                        @Keep
+                        fun onLocalOnlyInterfacesChanged(interfaces: Set<TetheringInterface>) {
+                            reference.get()?.onLocalOnlyInterfacesChanged(toInterfacesCompat(interfaces))
+                        }
+
+                        @Keep
+                        fun onError(iface: TetheringInterface, error: Int) {
+                            reference.get()?.onError(toInterfaceCompat(iface), error)
                         }
                     }
-                }) as TetheringManager.TetheringEventCallback
+                } catch (e: NoClassDefFoundError) {
+                    if (Build.VERSION.SDK_INT >= 31) Timber.w(e)
+                    LegacyCallback()
+                }
             }.also { if (!computed) return }
         }
-        Services.tethering.registerTetheringEventCallback(executor ?: InPlaceExecutor, proxy)
+        Services.tethering.registerTetheringEventCallback(executor ?: InPlaceExecutor, platformCallback)
     }
     /**
      * Remove tethering event callback previously registered with
@@ -630,11 +634,9 @@ object TetheringManagerCompat {
     fun getLastTetherError(iface: String): Int = getLastTetherError(Services.connectivity, iface) as Int
 
     val tetherErrorLookup = ConstantLookup("TETHER_ERROR_",
-            "TETHER_ERROR_NO_ERROR", "TETHER_ERROR_UNKNOWN_IFACE", "TETHER_ERROR_SERVICE_UNAVAIL",
-            "TETHER_ERROR_UNSUPPORTED", "TETHER_ERROR_UNAVAIL_IFACE", "TETHER_ERROR_MASTER_ERROR",
-            "TETHER_ERROR_TETHER_IFACE_ERROR", "TETHER_ERROR_UNTETHER_IFACE_ERROR", "TETHER_ERROR_ENABLE_NAT_ERROR",
-            "TETHER_ERROR_DISABLE_NAT_ERROR", "TETHER_ERROR_IFACE_CFG_ERROR", "TETHER_ERROR_PROVISION_FAILED",
-            "TETHER_ERROR_DHCPSERVER_ERROR", "TETHER_ERROR_ENTITLEMENT_UNKNOWN") @TargetApi(30) {
+            "NO_ERROR", "UNKNOWN_IFACE", "SERVICE_UNAVAIL", "UNSUPPORTED", "UNAVAIL_IFACE", "MASTER_ERROR",
+            "TETHER_IFACE_ERROR", "UNTETHER_IFACE_ERROR", "ENABLE_NAT_ERROR", "DISABLE_NAT_ERROR",
+            "IFACE_CFG_ERROR", "PROVISION_FAILED", "DHCPSERVER_ERROR", "ENTITLEMENT_UNKNOWN") @TargetApi(30) {
         TetheringManager::class.java
     }
 }

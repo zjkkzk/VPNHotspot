@@ -126,7 +126,7 @@ fun locate(
 
 private fun genAutoOptions(band: Int) = (1..band).filter { it and band == it }.map { ChannelOption(it) }
 
-data class SecurityOption(@StringRes val label: Int, val value: Int)
+data class SecurityOption(@param:StringRes val label: Int, val value: Int)
 
 fun SecurityOption.label(context: Context) = context.getString(label)
 
@@ -136,9 +136,9 @@ data class ChannelOption(val band: Int = 0, val channel: Int = 0) {
     }
 }
 
-class BandWidth(val width: Int, val name: String = "")
-
-fun BandWidth.label(context: Context) = channelBandwidthLabel(context, width, name)
+class BandWidth(val width: Int, val name: String = "") {
+    fun label(context: Context) = channelBandwidthLabel(context, width, name)
+}
 
 const val BASE64_FLAGS = Base64.NO_PADDING or Base64.NO_WRAP
 val MACHINE_TEXT_KEYBOARD_OPTIONS = KeyboardOptions(

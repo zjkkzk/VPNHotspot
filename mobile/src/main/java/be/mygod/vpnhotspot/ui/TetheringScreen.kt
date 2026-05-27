@@ -8,9 +8,10 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.net.MacAddress
 import android.net.TetheringManager
+import android.net.wifi.OuiKeyedData
+import android.net.wifi.`WifiManager$SoftApCallback`
 import android.net.wifi.p2p.WifiP2pGroup
 import android.os.Build
-import android.os.Parcelable
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -22,13 +23,11 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.input.TextFieldLineLimits
 import androidx.compose.foundation.text.input.TextFieldState
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.SnackbarHostState
@@ -50,7 +49,6 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalInspectionMode
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.TextLinkStyles
@@ -58,9 +56,9 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.core.net.toUri
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
+import androidx.core.net.toUri
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleOwner
@@ -76,16 +74,15 @@ import be.mygod.vpnhotspot.TetheringService
 import be.mygod.vpnhotspot.manage.BluetoothTethering
 import be.mygod.vpnhotspot.manage.ManageBar
 import be.mygod.vpnhotspot.net.MacAddressCompat
+import be.mygod.vpnhotspot.net.TetherOffloadManager
 import be.mygod.vpnhotspot.net.TetherStates
 import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.TetheringManagerCompat
-import be.mygod.vpnhotspot.net.wifi.SoftApCapability
 import be.mygod.vpnhotspot.net.wifi.SoftApConfigurationCompat
-import be.mygod.vpnhotspot.net.wifi.SoftApInfo
 import be.mygod.vpnhotspot.net.wifi.WifiApManager
 import be.mygod.vpnhotspot.net.wifi.WifiP2pManagerHelper
 import be.mygod.vpnhotspot.root.WifiApCommands
-import be.mygod.vpnhotspot.ui.apconfiguration.formatTimeoutMillis
+import be.mygod.vpnhotspot.ui.apconfiguration.VendorData
 import be.mygod.vpnhotspot.ui.theme.VpnHotspotPreviewSurface
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.readableMessage
@@ -107,26 +104,24 @@ data class TetheringServiceState(
 @Composable
 fun TetheringScreen(
     snackbarHostState: SnackbarHostState,
-    repeaterBinder: RepeaterService.Binder?,
-    localOnlyBinder: LocalOnlyHotspotService.Binder?,
+    repeaterStatus: RepeaterService.Status?,
+    repeaterGroup: WifiP2pGroup?,
+    localOnlyIface: String?,
     tetherStates: TetherStates,
     tetheringServiceState: TetheringServiceState,
     interfaceRefreshVersion: Int = 0,
     onConfigureRepeater: () -> Unit,
     onConfigureTemporaryHotspot: (() -> Unit)?,
     onConfigureAp: () -> Unit,
+    onStopRepeater: () -> Unit,
+    onStopTemporaryHotspot: () -> Unit,
+    onStartRepeaterWps: (String?) -> Unit,
 ) {
     val context = LocalContext.current
     val inspectionMode = LocalInspectionMode.current
     val scope = rememberCoroutineScope()
     val linkStyles = rememberNetworkAddressLinkStyles()
     val repeaterMissingLocationPermissions = stringResource(R.string.repeater_missing_location_permissions)
-    val localOnlyIface by (localOnlyBinder?.iface)?.collectAsStateWithLifecycle(null)
-        ?: remember { mutableStateOf<String?>(null) }
-    val repeaterStatus by (repeaterBinder?.status)?.collectAsStateWithLifecycle(null)
-        ?: remember { mutableStateOf<RepeaterService.Status?>(null) }
-    val repeaterGroup by (repeaterBinder?.group)?.collectAsStateWithLifecycle(null)
-        ?: remember { mutableStateOf<WifiP2pGroup?>(null) }
     val staticIpActive by StaticIpSetter.active.collectAsStateWithLifecycle()
     val staticIpAddresses by StaticIpSetter.addresses.collectAsStateWithLifecycle()
     val staticIpApplying by StaticIpSetter.applying.collectAsStateWithLifecycle()
@@ -142,7 +137,9 @@ fun TetheringScreen(
     var wpsPin by rememberTextFieldValueAtEnd("", wpsDialog)
     val tetherTypeVersion by if (inspectionMode) remember { mutableIntStateOf(0) } else rememberTetherTypeVersion()
     var manageBarVersion by remember { mutableIntStateOf(0) }
-    val manageOffloadEnabled = if (inspectionMode) false else remember(manageBarVersion) { ManageBar.offloadEnabled }
+    val manageOffloadEnabled = if (inspectionMode) false else remember(manageBarVersion) {
+        TetherOffloadManager.enabled
+    }
     val ifaceLookup = remember(
         tetherStates,
         tetheringServiceState,
@@ -170,12 +167,12 @@ fun TetheringScreen(
         context.getSystemService<BluetoothManager>()?.adapter
     }
     val bluetoothTethering = remember(bluetoothAdapter) {
-        bluetoothAdapter?.let { BluetoothTethering(context, it) { bluetoothVersion++ } }
+        bluetoothAdapter?.let { BluetoothTethering(it) { bluetoothVersion++ } }
     }
     val requestBluetooth = if (inspectionMode) null else {
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
-                bluetoothTethering?.ensureInit(context)
+                bluetoothTethering?.ensureInit()
                 bluetoothVersion++
             }
         }
@@ -190,7 +187,7 @@ fun TetheringScreen(
             if (bluetoothTethering == null || Build.VERSION.SDK_INT < 31) return
             if (ContextCompat.checkSelfPermission(context, Manifest.permission.BLUETOOTH_CONNECT) ==
                 PackageManager.PERMISSION_GRANTED) {
-                bluetoothTethering.ensureInit(context)
+                bluetoothTethering.ensureInit()
                 bluetoothVersion++
             } else requestBluetooth?.launch(Manifest.permission.BLUETOOTH_CONNECT)
         }
@@ -236,7 +233,7 @@ fun TetheringScreen(
             repeaterStatus == RepeaterService.Status.ACTIVE) && WifiP2pManagerHelper.startWps != null
     val showBluetooth = inspectionMode || (context.packageManager.hasSystemFeature(PackageManager.FEATURE_BLUETOOTH) &&
             bluetoothTethering != null)
-    val bluetoothActive = remember(showBluetooth, bluetoothTethering, bluetoothVersion) {
+    val bluetoothActive = remember(showBluetooth, bluetoothTethering, bluetoothVersion, tetherStates.tethered) {
         if (showBluetooth) bluetoothTethering?.active else null
     }
 
@@ -250,7 +247,7 @@ fun TetheringScreen(
                         RepeaterService.Status.IDLE -> startRepeater(if (Build.VERSION.SDK_INT >= 33) {
                             Manifest.permission.NEARBY_WIFI_DEVICES
                         } else Manifest.permission.ACCESS_FINE_LOCATION)
-                        RepeaterService.Status.ACTIVE -> repeaterBinder?.shutdown()
+                        RepeaterService.Status.ACTIVE -> onStopRepeater()
                         else -> { }
                     }
                 }
@@ -270,7 +267,7 @@ fun TetheringScreen(
                         modifier = Modifier.padding(start = 48.dp),
                         icon = R.drawable.ic_wifi_protected_setup,
                         title = stringResource(R.string.repeater_wps),
-                        onClick = { if (repeaterBinder?.active == true) wpsDialog = true },
+                        onClick = { if (active) wpsDialog = true },
                     )
                 }
             }
@@ -280,7 +277,7 @@ fun TetheringScreen(
                         startLocalOnly(if (Build.VERSION.SDK_INT >= 33) {
                             Manifest.permission.NEARBY_WIFI_DEVICES
                         } else Manifest.permission.ACCESS_FINE_LOCATION)
-                    } else localOnlyBinder?.stop()
+                    } else onStopTemporaryHotspot()
                 }
                 TetheringRow(
                     icon = R.drawable.ic_android_wifi_3_bar_plus,
@@ -490,7 +487,7 @@ fun TetheringScreen(
             },
             confirmButton = {
                 DialogConfirmButton(onClick = {
-                    repeaterBinder?.startWps(wpsPin.text)
+                    onStartRepeaterWps(wpsPin.text)
                     wpsDialog = false
                 }) {
                     Text(stringResource(android.R.string.ok))
@@ -498,7 +495,7 @@ fun TetheringScreen(
             },
             dismissButton = {
                 DialogNeutralButton(onClick = {
-                    repeaterBinder?.startWps(null)
+                    onStartRepeaterWps(null)
                     wpsDialog = false
                 }) {
                     Text(stringResource(R.string.repeater_wps_dialog_pbc))
@@ -639,13 +636,17 @@ private fun TetheringPreview() {
     VpnHotspotPreviewSurface {
         TetheringScreen(
             snackbarHostState = remember { SnackbarHostState() },
-            repeaterBinder = null,
-            localOnlyBinder = null,
+            repeaterStatus = null,
+            repeaterGroup = null,
+            localOnlyIface = null,
             tetherStates = TetherStates(),
             tetheringServiceState = TetheringServiceState(),
             onConfigureRepeater = {},
             onConfigureTemporaryHotspot = null,
             onConfigureAp = {},
+            onStopRepeater = {},
+            onStopTemporaryHotspot = {},
+            onStartRepeaterWps = {},
         )
     }
 }
@@ -720,24 +721,22 @@ private fun rememberWifiSummary(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val locale = LocalConfiguration.current.locales[0]
+    if (Build.VERSION.SDK_INT >= 30) return rememberWifiSummaryApi30(baseError, linkStyles)
     return produceState(baseError, context, lifecycleOwner, locale, baseError, linkStyles) {
         var wifiFailureReason: Int? = null
         var wifiNumClients: Int? = null
-        var wifiInfo = emptyList<Parcelable>()
-        var wifiCapability: Parcelable? = null
         fun update() {
             value = wifiSummary(
                 context,
                 locale,
                 wifiFailureReason,
                 wifiNumClients,
-                wifiInfo,
-                wifiCapability,
+                null,
+                null,
                 baseError,
-                linkStyles,
             )
         }
-        val callback = object : WifiApManager.SoftApCallbackCompat {
+        val callback = object : `WifiManager$SoftApCallback` {
             override fun onStateChanged(state: Int, failureReason: Int) {
                 if (!WifiApManager.checkWifiApState(state)) return
                 wifiFailureReason = if (state == WifiApManager.WIFI_AP_STATE_FAILED) failureReason else null
@@ -746,16 +745,6 @@ private fun rememberWifiSummary(
 
             override fun onNumClientsChanged(numClients: Int) {
                 wifiNumClients = numClients
-                update()
-            }
-
-            override fun onInfoChanged(info: List<Parcelable>) {
-                wifiInfo = info
-                update()
-            }
-
-            override fun onCapabilityChanged(capability: Parcelable) {
-                wifiCapability = capability
                 update()
             }
         }
@@ -785,15 +774,14 @@ private fun rememberWifiSummary(
     }
 }
 
-private fun wifiSummary(
+internal fun wifiSummary(
     context: Context,
     locale: Locale,
     failureReason: Int?,
     numClients: Int?,
-    info: List<Parcelable>,
-    capability: Parcelable?,
+    info: AnnotatedString?,
+    maxSupportedClients: Int?,
     baseError: AnnotatedString?,
-    linkStyles: TextLinkStyles,
 ): AnnotatedString? {
     val integerFormat = NumberFormat.getIntegerInstance(locale)
     val summary = buildAnnotatedString {
@@ -803,55 +791,13 @@ private fun wifiSummary(
         }
         failureReason?.let { line { append(softApStartFailureLabel(context, it)) } }
         baseError?.takeIf { it.text.isNotEmpty() }?.let { line { append(it) } }
-        for (parcel in info) line {
-            val softApInfo = SoftApInfo(parcel)
-            val frequency = softApInfo.frequency
-            val channel = SoftApConfigurationCompat.frequencyToChannel(frequency)
-            val bandwidth = channelBandwidthLabel(context, softApInfo.bandwidth)
-            if (Build.VERSION.SDK_INT >= 31) {
-                val bssid = softApInfo.bssid?.toString()
-                val bssidAp = bssid?.let { softApInfo.apInstanceIdentifier?.let { id -> "$it%$id" } ?: it }
-                    ?: softApInfo.apInstanceIdentifier ?: "?"
-                val timeout = softApInfo.autoShutdownTimeoutMillis
-                val line = context.getString(if (timeout == 0L) {
-                    R.string.tethering_manage_wifi_info_timeout_disabled
-                } else R.string.tethering_manage_wifi_info_timeout_enabled,
-                    integerFormat.format(frequency.toLong()),
-                    integerFormat.format(channel.toLong()),
-                    bandwidth,
-                    bssidAp,
-                    integerFormat.format(softApInfo.wifiStandard.toLong()),
-                    formatTimeoutMillis(context, timeout),
-                )
-                val bssidText = bssid
-                if (bssidText == null) {
-                    append(line)
-                } else {
-                    val bssidStart = line.indexOf(bssidText)
-                    if (bssidStart < 0) append(line) else {
-                        append(line.substring(0, bssidStart))
-                        appendMacAddress(bssidText, linkStyles)
-                        append(line.substring(bssidStart + bssidText.length))
-                    }
-                }
-            } else append(context.getString(
-                    R.string.tethering_manage_wifi_info,
-                    integerFormat.format(frequency.toLong()),
-                    integerFormat.format(channel.toLong()),
-                    bandwidth,
-                ))
-            softApInfo.mldAddress?.let {
-                append(", MLD MAC ")
-                appendMacAddress(it.toString(), linkStyles)
-            }
-        }
-        capability?.takeIf { Build.VERSION.SDK_INT >= 30 }?.let { parcel ->
-            val capability = SoftApCapability(parcel)
+        info?.takeIf { it.text.isNotEmpty() }?.let { line { append(it) } }
+        maxSupportedClients?.let {
             line { append(context.resources.getQuantityString(
                 R.plurals.tethering_manage_wifi_client_limit,
                 numClients ?: 0,
                 numClients?.let { integerFormat.format(it.toLong()) } ?: "?",
-                integerFormat.format(capability.maxSupportedClients.toLong()),
+                integerFormat.format(it.toLong()),
             )) }
         } ?: numClients?.let {
             line { append(context.resources.getQuantityString(
@@ -924,29 +870,39 @@ private fun repeaterSummary(
     ifaceLookup: Map<String, NetworkInterface>,
     linkStyles: TextLinkStyles,
 ): AnnotatedString? {
-    val addresses = group?.let { p2pGroup ->
+    group ?: return null
+    val summary = buildAnnotatedString {
+        val frequency = group.frequency
+        if (frequency != 0) append(context.getString(
+            R.string.repeater_frequency,
+            NumberFormat.getIntegerInstance(context.resources.configuration.locales[0]).format(frequency.toLong()),
+        ))
         networkInterfaceAddressesText(
-            ifaceLookup[p2pGroup.`interface`],
+            ifaceLookup[group.`interface`],
             linkStyles,
             macOverride = if (Build.VERSION.SDK_INT >= 30) try {
-                (wifiP2pGroupInterfaceAddress[p2pGroup] as ByteArray?)?.let(MacAddress::fromBytes)
+                (wifiP2pGroupInterfaceAddress[group] as ByteArray?)?.let(MacAddress::fromBytes)
             } catch (e: NoSuchFieldException) {
                 if (Build.VERSION.SDK_INT >= 34) Timber.w(e)
                 null
             } else null,
-        )
-    }
-    val frequency = group?.frequency
-    return if (frequency == null || frequency == 0) addresses else buildAnnotatedString {
-        append(context.getString(
-            R.string.repeater_frequency,
-            NumberFormat.getIntegerInstance(context.resources.configuration.locales[0]).format(frequency.toLong()),
-        ))
-        if (addresses?.text?.isNotEmpty() == true) {
-            append('\n')
-            append(addresses)
+        ).let { addresses ->
+            if (addresses.text.isNotEmpty()) {
+                if (length > 0) append('\n')
+                append(addresses)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 35) {
+            @Suppress("UNCHECKED_CAST")
+            val data = VendorData.serialize(getWifiP2pGroupVendorData(group) as List<OuiKeyedData>)
+            if (data.isNotEmpty()) {
+                if (length > 0) append('\n')
+                append(context.getString(R.string.tethering_manage_wifi_vendor_data, data))
+            }
         }
     }
+    return if (summary.text.isEmpty()) null else summary
 }
 
 private val wifiP2pGroupInterfaceAddress by lazy { WifiP2pGroup::class.java.getDeclaredField("interfaceAddress") }
+private val getWifiP2pGroupVendorData by lazy { WifiP2pGroup::class.java.getDeclaredMethod("getVendorData") }

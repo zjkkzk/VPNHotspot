@@ -38,14 +38,14 @@ class TetheringService : NetlinkNeighbourMonitoringService(), TetherStates.Callb
         }
     }
 
-    inner class Binder : android.os.Binder() {
-        val managedIfaces = this@TetheringService.managedIfaces.asStateFlow()
-        val inactiveIfaces = inactiveIfaceSet.asStateFlow()
-        val monitoredIfaces = monitoredIfaceSet.asStateFlow()
+    class Binder(owner: TetheringService) : android.os.Binder() {
+        val managedIfaces = owner.managedIfaces.asStateFlow()
+        val inactiveIfaces = owner.inactiveIfaceSet.asStateFlow()
+        val monitoredIfaces = owner.monitoredIfaceSet.asStateFlow()
 
-        fun isActive(iface: String) = this@TetheringService.managedIfaces.value.contains(iface)
-        fun isInactive(iface: String) = inactiveIfaceSet.value.contains(iface)
-        fun monitored(iface: String) = monitoredIfaceSet.value.contains(iface)
+        fun isActive(iface: String) = managedIfaces.value.contains(iface)
+        fun isInactive(iface: String) = inactiveIfaces.value.contains(iface)
+        fun monitored(iface: String) = monitoredIfaces.value.contains(iface)
     }
 
     private class Downstream(caller: Any, downstream: String, var monitor: Boolean = false) :
@@ -72,7 +72,7 @@ class TetheringService : NetlinkNeighbourMonitoringService(), TetherStates.Callb
     private val managedIfaces = MutableStateFlow<ScatterSet<String>>(emptyScatterSet())
     private val inactiveIfaceSet = MutableStateFlow<ScatterSet<String>>(emptyScatterSet())
     private val monitoredIfaceSet = MutableStateFlow<ScatterSet<String>>(emptyScatterSet())
-    private val binder = Binder()
+    private val binder = Binder(this)
     private var downstreams = MutableScatterMap<String, Downstream>()
     private var tetherStatesRegistered = false
     private var tetheredIfaces: ScatterSet<String>? = null
@@ -123,18 +123,18 @@ class TetheringService : NetlinkNeighbourMonitoringService(), TetherStates.Callb
                 if (!downstream.started) inactiveIfaces.add(downstream.downstream)
             }
         }
+        monitoredIfaces.also { ifaces ->
+            if (ifaces.isEmpty()) {
+                BootReceiver.delete<TetheringService>()
+            } else BootReceiver.add<TetheringService>(Starter(ArrayList<String>(ifaces.size).apply {
+                ifaces.forEach { iface -> add(iface) }
+            }))
+        }
         if (managedIfaces.isEmpty()) {
             unregisterReceiver()
             ServiceNotification.stopForeground(this)
             stopSelf()
         } else {
-            monitoredIfaces.also { ifaces ->
-                if (ifaces.isEmpty()) {
-                    BootReceiver.delete<TetheringService>()
-                } else BootReceiver.add<TetheringService>(Starter(ArrayList<String>(ifaces.size).apply {
-                    ifaces.forEach { iface -> add(iface) }
-                }))
-            }
             if (!tetherStatesRegistered) {
                 withContext(Dispatchers.Main.immediate) {
                     TetherStates.registerCallback(this@TetheringService)

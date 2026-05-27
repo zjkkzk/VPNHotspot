@@ -175,7 +175,10 @@ The reply socket pool separates DNS replies from user UDP associations. User
 associations reserve a reply source while alive so downstream responses can use
 the original destination as their source. DNS keeps retained reply sockets by
 source/mark because DNS requests are short child tasks rather than entries in
-the association table.
+the association table. Host- or network-unreachable downstream reply sends are
+treated as client reachability churn and logged. Reply socket acquisition,
+replacement, and other unexpected send failures are reported as structured
+nonfatals.
 
 UDP hop-limit behavior is part of the NAT66 contract. Missing hop-limit
 metadata is reported and the datagram is dropped. Expired hop limit produces a
@@ -234,7 +237,9 @@ Exceeded, and Parameter Problem. Generated downstream ICMP errors preserve the
 upstream offender source when that source is meaningful on the downstream link;
 link-local upstream offenders are rewritten to the NAT66 gateway. Error quotes
 are capped so the complete generated IPv6 packet stays within the IPv6 minimum
-MTU. Unmapped remote ICMP errors are not guessed into downstream errors.
+MTU. Expected kernel socket errors from remote ICMP delivery are consumed after
+error-queue processing when no daemon-owned quote can be mapped. Unmapped remote
+ICMP errors are not guessed into downstream errors.
 
 ICMPv6 counters count one sent unit per daemon-owned upstream Echo Request and
 one received unit per upstream Echo Reply or upstream ICMPv6 error translated

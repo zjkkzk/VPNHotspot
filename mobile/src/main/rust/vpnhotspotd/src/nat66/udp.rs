@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 use super::{sleep_until_deadline, IDLE_TIMEOUT};
 use crate::dns::{resolve_or_error_counted, DNS_PORT};
 use crate::nat66::icmp;
-use crate::report;
 use crate::upstream::connect_udp;
+use crate::{report, socket::is_kernel_icmp_error};
 use vpnhotspotd::shared::icmp_nat::{is_special_destination, nat66_hop_limit, Nat66HopLimit};
 use vpnhotspotd::shared::model::{mac_string, select_network, SessionConfig};
 use vpnhotspotd::shared::nat66_counter::{Nat66CounterSource, Nat66Counters};
@@ -29,9 +29,7 @@ use reply_socket::{
     report_send_response_error, send_response, ReplySocketKey, ReplySocketPool,
     ReplySocketReservation,
 };
-use socket_io::{
-    enable_recv_hop_limit, forward_udp_datagram, is_udp_icmp_error, recv_packet, UdpForwardResult,
-};
+use socket_io::{enable_recv_hop_limit, forward_udp_datagram, recv_packet, UdpForwardResult};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct AssociationKey {
@@ -123,6 +121,7 @@ pub(crate) fn spawn_loop(
                 .min();
 
             select! {
+                biased;
                 _ = stop.cancelled() => break,
                 _ = sleep_until_deadline(next_expiry) => {}
                 event = association_event_rx.recv() => match event {
@@ -171,6 +170,7 @@ pub(crate) fn spawn_loop(
                                     spawn(async move {
                                         let mut reply_socket = Some(reply_socket);
                                         select! {
+                                            biased;
                                             _ = query_stop.cancelled() => {}
                                             response = resolve_or_error_counted(&snapshot, &query, &dns, mac) => {
                                                 if let Some(response) = response {
@@ -471,6 +471,7 @@ impl AssociationTask {
         let mut buffer = [0u8; 65535];
         loop {
             select! {
+                biased;
                 _ = self.stop.cancelled() => break,
                 result = self.socket.recv(&mut buffer) => match result {
                     Ok(size) => {
@@ -498,7 +499,7 @@ impl AssociationTask {
                         }
                         self.report_active();
                     }
-                    Err(e) if self.icmp_errors_registered && is_udp_icmp_error(&e) => continue,
+                    Err(e) if self.icmp_errors_registered && is_kernel_icmp_error(&e) => continue,
                     Err(e) => {
                         report::io_with_details(
                             "nat66.udp_upstream_recv",

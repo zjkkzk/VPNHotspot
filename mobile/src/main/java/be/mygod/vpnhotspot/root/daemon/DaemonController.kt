@@ -12,6 +12,7 @@ import be.mygod.librootkotlinx.net.ALocalServerSocket
 import be.mygod.librootkotlinx.net.ALocalSocket
 import be.mygod.vpnhotspot.App.Companion.app
 import be.mygod.vpnhotspot.io.drainLines
+import be.mygod.vpnhotspot.io.isEBADF
 import be.mygod.vpnhotspot.root.RootManager
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.widget.SmartSnackbar
@@ -49,6 +50,7 @@ import kotlin.time.Duration.Companion.seconds
 
 object DaemonController {
     private const val BINARY_NAME = "vpnhotspotd"
+    private val binaryFrameClassName get() = "${app.packageName}.$BINARY_NAME"
 
     private val lock = Mutex()
     private var socket: ALocalSocket? = null
@@ -62,6 +64,7 @@ object DaemonController {
     private val logScope = CoroutineScope(Dispatchers.Main.immediate + SupervisorJob())
     private val stdoutLog = DaemonLog("stdout") { Timber.tag(BINARY_NAME).i(it) }
     private val stderrLog = DaemonLog("stderr") { Timber.tag(BINARY_NAME).e(it) }
+    private var daemonCommandAbiChecked = false
 
     /**
      * Android 10 bionic supports direct linker execution of uncompressed, page-aligned zip entries:
@@ -136,6 +139,11 @@ object DaemonController {
     private suspend fun ensureDaemonLocked() {
         if (socket != null) return
         Timber.d("Starting $BINARY_NAME")
+        val command = daemonCommand
+        if (!daemonCommandAbiChecked) {
+            DaemonAbi.check(command[1])
+            daemonCommandAbiChecked = true
+        }
         daemonStdioClosing = false
         daemonStdioEofReported = false
         val socketName = "be.mygod.vpnhotspot.${Process.myPid()}.${Random.nextLong().toHexString()}"
@@ -147,7 +155,7 @@ object DaemonController {
             ALocalServerSocket(LocalServerSocket(socketName), Services.mainHandler).use { serverSocket ->
                 RootManager.use { server ->
                     try {
-                        server.execute(RunDaemon(daemonCommand, socketName, stdout!!, stderr!!))
+                        server.execute(RunDaemon(command, socketName, stdout!!, stderr!!))
                     } finally {
                         try {
                             stdout?.close()
@@ -316,7 +324,7 @@ object DaemonController {
                             val frame = envelope.error
                             val id = frame.call_id.readCallId()
                             val report = frame.report ?: throw IOException("Missing daemon error report")
-                            val exception = DaemonException(report, id)
+                            val exception = DaemonException(report, id, daemonClassName = binaryFrameClassName)
                             val call = lock.withLock {
                                 val call = calls.remove(id)
                                 if (call == null) Timber.w("Unexpected $BINARY_NAME error for call $id")
@@ -335,6 +343,7 @@ object DaemonController {
                             val traced = DaemonException(
                                 report,
                                 frame.call_id?.readCallId(),
+                                daemonClassName = binaryFrameClassName,
                             ).withCurrentTrace()
                             Timber.tag(BINARY_NAME).w(traced)
                             SmartSnackbar.make(traced).show()
@@ -489,6 +498,8 @@ object DaemonController {
                         }
                     } catch (e: ErrnoException) {
                         if (e.errno != OsConstants.EBADF) Timber.w(e)
+                    } catch (e: IOException) {
+                        if (!e.isEBADF) Timber.w(e)
                     }
                 }
                 return writeEnd!!.also { writeEnd = null }
@@ -508,6 +519,8 @@ object DaemonController {
                     it.drain()
                 } catch (e: ErrnoException) {
                     if (e.errno != OsConstants.EBADF) Timber.w(e)
+                } catch (e: IOException) {
+                    if (!e.isEBADF) Timber.w(e)
                 }
             }
             job?.cancelAndJoin()
@@ -517,6 +530,8 @@ object DaemonController {
                     it.drainLines(line, flushPartial = true, block = log)
                 } catch (e: ErrnoException) {
                     if (e.errno != OsConstants.EBADF) Timber.w(e)
+                } catch (e: IOException) {
+                    if (!e.isEBADF) Timber.w(e)
                 } finally {
                     it.cancel(null)
                 }

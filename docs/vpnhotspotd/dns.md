@@ -90,7 +90,9 @@ I/O failures are returned to the connection task.
 
 UDP DNS reads one datagram, clones the config snapshot, and resolves the query
 in a child task. If resolution succeeds, the response is sent back to the
-datagram source. Send failures are reported with source context.
+datagram source. Host- or network-unreachable reply sends are treated as
+downstream reachability churn and logged with source context. Other send
+failures are reported with source context.
 
 The UDP listener intentionally does not serialize all queries through one
 worker. Each query has its own child task tied to the session stop token.
@@ -102,11 +104,16 @@ Resolver failure normally returns a SERVFAIL response when the query can be
 parsed enough to build one. If a SERVFAIL response cannot be generated, the
 query is dropped.
 
-Per-query resolver failures are logged but do not stop the DNS runtime. Listener
-setup failures do not stop the session. Routing omits the missing DNS redirect,
-so normal IP traffic and manually configured downstream DNS can still work.
+Unexpected per-query resolver failures are logged but do not stop the DNS
+runtime. Routine resolver unavailability, such as no selected upstream network
+or an Android resolver timeout, returns SERVFAIL when possible without emitting
+one stderr log per query. Listener setup failures do not stop the session.
+Routing omits the missing DNS redirect, so normal IP traffic and manually
+configured downstream DNS can still work.
 
 Per-MAC listener setup and routing failures remove only that MAC/protocol DNS
 capability. If a listener was staged but routing did not commit the matching
 MAC redirect and direct-port guard, the staged listener is cancelled before the
-session publishes committed capabilities.
+session publishes committed capabilities. A TCP listener accept failure after
+cancellation is treated as teardown; transient active-listener accept failures
+are retried.

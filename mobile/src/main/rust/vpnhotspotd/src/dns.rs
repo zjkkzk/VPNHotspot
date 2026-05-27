@@ -16,7 +16,7 @@ use tokio::{select, spawn};
 use tokio_util::sync::CancellationToken;
 
 use crate::report;
-use crate::socket::{is_connection_closed, set_nonblocking};
+use crate::socket::{is_connection_closed, is_udp_reply_unreachable, set_nonblocking};
 use vpnhotspotd::shared::dns_counter::DnsCounters;
 use vpnhotspotd::shared::dns_wire;
 use vpnhotspotd::shared::model::{mac_string, ClientDnsPorts, Network, SessionConfig};
@@ -347,6 +347,7 @@ fn spawn_tcp_loop(
     spawn(async move {
         loop {
             select! {
+                biased;
                 _ = stop.cancelled() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((socket, _)) => {
@@ -355,6 +356,7 @@ fn spawn_tcp_loop(
                         let connection_stop = stop.child_token();
                         spawn(async move {
                             select! {
+                                biased;
                                 _ = connection_stop.cancelled() => {}
                                 result = async {
                                     let snapshot = config.lock().await.clone();
@@ -369,7 +371,22 @@ fn spawn_tcp_loop(
                             }
                         });
                     }
-                    Err(e) => report::io("dns.tcp_accept", e),
+                    Err(e) => {
+                        if stop.is_cancelled() {
+                            break;
+                        }
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                        ) {
+                            continue;
+                        }
+                        report::io_with_details(
+                            "dns.tcp_accept",
+                            e,
+                            [("mac", mac_string(&mac))],
+                        );
+                    }
                 }
             }
         }
@@ -444,6 +461,7 @@ fn spawn_udp_loop(
         let mut buffer = [0u8; 65535];
         loop {
             select! {
+                biased;
                 _ = stop.cancelled() => break,
                 received = socket.recv_from(&mut buffer) => match received {
                     Ok((size, source)) => {
@@ -454,6 +472,7 @@ fn spawn_udp_loop(
                         let counters = counters.clone();
                         spawn(async move {
                             select! {
+                                biased;
                                 _ = query_stop.cancelled() => {}
                                 response = resolve_or_error(&snapshot, &query) => {
                                     if let Some(response) = response {
@@ -467,11 +486,17 @@ fn spawn_udp_loop(
                                             report::io("dns.counter", e);
                                         }
                                         if let Err(e) = socket.send_to(&response.bytes, source).await {
-                                            report::io_with_details(
-                                                "dns.udp_response",
-                                                e,
-                                                [("source", source.to_string())],
-                                            );
+                                            if is_udp_reply_unreachable(&e) {
+                                                report::stderr!(
+                                                    "dns udp response dropped: source={source}: {e}"
+                                                );
+                                            } else {
+                                                report::io_with_details(
+                                                    "dns.udp_response",
+                                                    e,
+                                                    [("source", source.to_string())],
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -514,7 +539,12 @@ async fn resolve_or_error(config: &SessionConfig, query: &[u8]) -> Option<DnsRes
             received_from_resolver: true,
         }),
         Err(e) => {
-            report::stderr!("dns resolve failed: {e}");
+            if !matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::NotConnected
+            ) {
+                report::stderr!("dns resolve failed: {e}");
+            }
             dns_wire::servfail_response(query).map(|response| DnsResponse {
                 bytes: response,
                 sent_to_resolver,
