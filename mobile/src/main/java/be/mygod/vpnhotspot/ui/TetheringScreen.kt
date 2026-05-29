@@ -9,7 +9,6 @@ import android.content.res.Configuration
 import android.net.MacAddress
 import android.net.TetheringManager
 import android.net.wifi.OuiKeyedData
-import android.net.wifi.`WifiManager$SoftApCallback`
 import android.net.wifi.p2p.WifiP2pGroup
 import android.os.Build
 import android.provider.Settings
@@ -78,7 +77,6 @@ import be.mygod.vpnhotspot.net.TetherOffloadManager
 import be.mygod.vpnhotspot.net.TetherStates
 import be.mygod.vpnhotspot.net.TetherType
 import be.mygod.vpnhotspot.net.TetheringManagerCompat
-import be.mygod.vpnhotspot.net.wifi.SoftApConfigurationCompat
 import be.mygod.vpnhotspot.net.wifi.WifiApManager
 import be.mygod.vpnhotspot.net.wifi.WifiP2pManagerHelper
 import be.mygod.vpnhotspot.root.WifiApCommands
@@ -86,7 +84,9 @@ import be.mygod.vpnhotspot.ui.apconfiguration.VendorData
 import be.mygod.vpnhotspot.ui.theme.VpnHotspotPreviewSurface
 import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.readableMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.lang.reflect.InvocationTargetException
@@ -520,21 +520,19 @@ private fun TetheringTypeRow(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val toggle = toggle@{
+    val toggle: () -> Unit = toggle@{
         if (!Settings.System.canWrite(context)) try {
             context.startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, "package:${context.packageName}".toUri()))
             return@toggle
         } catch (e: RuntimeException) {
             app.logEvent("manage_write_settings") { param("message", e.toString()) }
         }
-        val callback = tetheringCallback(
-            context,
-            snackbarHostState,
-            TetherType.fromTetheringType(tetheringType),
-            scope,
-        )
-        if (checked) TetheringManagerCompat.stopTethering(tetheringType, callback)
-        else TetheringManagerCompat.startTethering(tetheringType, true, callback)
+        scope.launch {
+            runTethering(context, snackbarHostState, TetherType.fromTetheringType(tetheringType)) {
+                if (checked) TetheringManagerCompat.stopTethering(tetheringType)
+                else TetheringManagerCompat.startTethering(tetheringType, true)
+            }
+        }
     }
     TetheringRow(
         icon = icon,
@@ -569,13 +567,17 @@ private fun BluetoothTetheringRow(
             } catch (e: RuntimeException) {
                 app.logEvent("manage_write_settings") { param("message", e.toString()) }
             }
-            val callback = tetheringCallback(context, snackbarHostState, TetherType.BLUETOOTH, scope, onRefresh)
             when (active) {
-                true -> {
-                    bluetoothTethering?.stop(callback)
-                    onRefresh()
+                true -> scope.launch {
+                    runTethering(context, snackbarHostState, TetherType.BLUETOOTH, onRefresh) {
+                        bluetoothTethering?.stop()
+                    }
                 }
-                false -> bluetoothTethering?.start(callback, context)
+                false -> scope.launch {
+                    runTethering(context, snackbarHostState, TetherType.BLUETOOTH, onRefresh) {
+                        bluetoothTethering?.start(context)
+                    }
+                }
                 null -> ManageBar.start(context::startActivity)
             }
         },
@@ -651,50 +653,39 @@ private fun TetheringPreview() {
     }
 }
 
-private fun tetheringCallback(
+/**
+ * Run a tether start/stop ([block]) and surface the outcome: [onChanged] on success, a permission
+ * prompt or snackbar for a [TetheringManagerCompat.Failure] error code, and a toast + Manage screen
+ * for any other exception. Mirrors the old tetheringCallback object.
+ */
+private suspend fun runTethering(
     context: Context,
     snackbarHostState: SnackbarHostState,
     tetherType: TetherType,
-    scope: CoroutineScope,
     onChanged: () -> Unit = {},
-) = object : TetheringManagerCompat.StartTetheringCallback, TetheringManagerCompat.StopTetheringCallback {
-    override fun onTetheringStarted() = onChanged()
-
-    override fun onStopTetheringSucceeded() = onChanged()
-
-    override fun onTetheringFailed(error: Int?) {
-        error?.let {
-            if (Build.VERSION.SDK_INT >= 30 && it == TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION) {
-                scope.launch {
-                    Toast.makeText(context, R.string.permission_missing, Toast.LENGTH_LONG).show()
-                    ManageBar.start(context::startActivity)
-                }
-            } else scope.launch {
-                snackbarHostState.showLongSnackbar(tetherErrorMessage(context, tetherType, it))
-            }
-        }
+    block: suspend () -> Unit,
+) {
+    try {
+        block()
         onChanged()
-    }
-
-    override fun onStopTetheringFailed(error: Int) {
-        if (error == TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION) {
-            scope.launch {
-                Toast.makeText(context, R.string.permission_missing, Toast.LENGTH_LONG).show()
-                ManageBar.start(context::startActivity)
-            }
-        } else scope.launch {
-            snackbarHostState.showLongSnackbar(tetherErrorMessage(context, tetherType, error))
-        }
+    } catch (e: CancellationException) {
+        throw e
+    } catch (e: TetheringManagerCompat.Failure) {
         onChanged()
+        e.errorCode?.let { showTetherError(context, snackbarHostState, tetherType, it) }
+    } catch (e: Exception) {
+        TetheringManagerCompat.reportException(e)
+        Toast.makeText(context, e.readableMessage, Toast.LENGTH_LONG).show()
+        ManageBar.start(context::startActivity)
     }
+}
 
-    override fun onException(e: Exception) {
-        super<TetheringManagerCompat.StartTetheringCallback>.onException(e)
-        scope.launch {
-            Toast.makeText(context, e.readableMessage, Toast.LENGTH_LONG).show()
-            ManageBar.start(context::startActivity)
-        }
-    }
+private suspend fun showTetherError(context: Context, snackbarHostState: SnackbarHostState, tetherType: TetherType,
+                                    error: Int) {
+    if (Build.VERSION.SDK_INT >= 30 && error == TetheringManager.TETHER_ERROR_NO_CHANGE_TETHERING_PERMISSION) {
+        Toast.makeText(context, R.string.permission_missing, Toast.LENGTH_LONG).show()
+        ManageBar.start(context::startActivity)
+    } else snackbarHostState.showLongSnackbar(tetherErrorMessage(context, tetherType, error))
 }
 
 private fun tetherErrorMessage(context: Context, tetherType: TetherType, error: Int) = context.getString(
@@ -736,40 +727,23 @@ private fun rememberWifiSummary(
                 baseError,
             )
         }
-        val callback = object : `WifiManager$SoftApCallback` {
-            override fun onStateChanged(state: Int, failureReason: Int) {
-                if (!WifiApManager.checkWifiApState(state)) return
-                wifiFailureReason = if (state == WifiApManager.WIFI_AP_STATE_FAILED) failureReason else null
-                update()
+        lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+            WifiApCommands.softApCallbackFlow(expensive = true).catch { e -> Timber.w(e) }.collect { event ->
+                when (event) {
+                    is WifiApManager.Event.OnStateChanged -> {
+                        if (!WifiApManager.checkWifiApState(event.state)) return@collect
+                        wifiFailureReason = if (event.state == WifiApManager.WIFI_AP_STATE_FAILED) {
+                            event.failureReason
+                        } else null
+                        update()
+                    }
+                    is WifiApManager.Event.OnNumClientsChanged -> {
+                        wifiNumClients = event.numClients
+                        update()
+                    }
+                    else -> { }
+                }
             }
-
-            override fun onNumClientsChanged(numClients: Int) {
-                wifiNumClients = numClients
-                update()
-            }
-        }
-        var registered = false
-        fun register() {
-            if (!registered) {
-                WifiApCommands.registerSoftApCallback(callback)
-                registered = true
-            }
-        }
-        fun unregister() {
-            if (registered) {
-                WifiApCommands.unregisterSoftApCallback(callback)
-                registered = false
-            }
-        }
-        val observer = object : DefaultLifecycleObserver {
-            override fun onStart(owner: LifecycleOwner) = register()
-            override fun onStop(owner: LifecycleOwner) = unregister()
-        }
-        lifecycleOwner.lifecycle.addObserver(observer)
-        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) register()
-        awaitDispose {
-            lifecycleOwner.lifecycle.removeObserver(observer)
-            unregister()
         }
     }
 }
