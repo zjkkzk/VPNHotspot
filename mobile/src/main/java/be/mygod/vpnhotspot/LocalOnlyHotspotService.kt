@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -50,11 +51,19 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
     class Binder(owner: LocalOnlyHotspotService) : android.os.Binder() {
         @Volatile
         private var service: LocalOnlyHotspotService? = owner
-        val iface = owner.iface.asStateFlow()
-        val configuration = owner.configuration.asStateFlow()
+        private val _iface = MutableStateFlow<String?>(null)
+        val iface = _iface.asStateFlow()
+        private val _configuration = MutableStateFlow<SoftApConfigurationCompat?>(null)
+        val configuration = _configuration.asStateFlow()
+
+        fun update(iface: String?, configuration: SoftApConfigurationCompat?) {
+            _iface.value = iface
+            _configuration.value = configuration
+        }
 
         fun detach() {
             service = null
+            update(null, null)
         }
 
         fun stop(shouldDisable: Boolean = true, exit: Boolean = false) {
@@ -91,16 +100,28 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
             refreshConfiguration()
         }
     private val iface = MutableStateFlow<String?>(null)
-    private val configuration = MutableStateFlow<SoftApConfigurationCompat?>(null)
     /**
-     * null represents IDLE, "" represents CONNECTING, "something" represents CONNECTED.
+     * Drives the foreground notification off [iface]: counts while connected ("something"), an empty
+     * notification while no active interface is owned (""), nothing (no foreground) while idle (null).
+     */
+    override val interfaces = iface.map { value ->
+        when {
+            value == null -> null
+            value.isEmpty() -> Interfaces()
+            else -> Interfaces(active = listOf(value))
+        }
+    }
+    /**
+     * null represents IDLE, "" represents a request without an active interface, "something" represents
+     * CONNECTED.
      */
     private fun updateIface(value: String?) {
         iface.value = value
         refreshConfiguration()
     }
     private fun refreshConfiguration() {
-        configuration.value = if (iface.value == null) null else reservation?.configuration
+        val currentIface = iface.value
+        binder.update(currentIface, if (currentIface == null) null else reservation?.configuration)
     }
     private val binder = Binder(this)
     private suspend fun collectLocalOnlyHotspotEvents(
@@ -193,7 +214,6 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
             val manager = RoutingManager.LocalOnly(this@LocalOnlyHotspotService, interfaceName)
             routingManager = manager
             manager.start()
-            if (routingManager === manager && iface.value == interfaceName) startNetlinkNeighbours()
         }
     }
 
@@ -207,7 +227,6 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
     private var localOnlyHotspotJob: Job? = null
     private val lifecycleGeneration = AtomicInteger()
     private var ifaceWaitJob: Job? = null
-    override val activeIfaces get() = iface.value.let { if (it.isNullOrEmpty()) emptyList() else listOf(it) }
 
     private var lastState: Triple<Int, String?, Int>? = null
     private val receiver = broadcastReceiver { _, intent -> updateState(intent) }
@@ -282,6 +301,8 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
         }
         try {
             collectLocalOnlyHotspotEvents(WifiApManager.startLocalOnlyHotspotFlow(), generation, requestJob)
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: IllegalStateException) {
             if (generation != lifecycleGeneration.get()) return
             // throws IllegalStateException if the caller attempts to start the LocalOnlyHotspot while they
@@ -310,13 +331,17 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
         val requestJob = localOnlyHotspotJob
         launch(start = CoroutineStart.UNDISPATCHED) {
             if (!exit && generation != lifecycleGeneration.get()) return@launch
+            // Withdraw the active interface from the shared notification before waiting for the LOHS
+            // request job to finish. The request cleanup can suspend behind framework callback teardown;
+            // leaving [iface] non-empty lets the notification collector keep publishing "0 connected"
+            // for this interface, which masks any inactive monitor entry for the same interface.
+            if (iface.value?.isNotEmpty() == true) updateIface("")
             requestJob?.join()
             routingMutex.withLock {
                 if (!exit && generation != lifecycleGeneration.get()) return@withLock
                 if (shouldDisable) BootReceiver.delete<LocalOnlyHotspotService>()
                 updateIface(null)
                 ifaceWaitJob?.cancel()
-                stopNetlinkNeighbours()
                 val manager = routingManager
                 manager?.stop()
                 if (routingManager === manager) routingManager = null
@@ -328,4 +353,8 @@ class LocalOnlyHotspotService : NetlinkNeighbourMonitoringService() {
             if (exit) cancel()
         }
     }
+
+    override fun countsFlow(active: List<String>) = if (Build.VERSION.SDK_INT >= 33) {
+        softApCountsFlow(active, WifiApCommands.localOnlyHotspotSoftApCallbackFlow())
+    } else super.countsFlow(active)
 }

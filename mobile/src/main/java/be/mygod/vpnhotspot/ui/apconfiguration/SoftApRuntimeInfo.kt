@@ -3,7 +3,6 @@ package be.mygod.vpnhotspot.ui.apconfiguration
 import android.content.Context
 import android.net.wifi.SoftApCapability
 import android.net.wifi.SoftApConfiguration
-import android.net.wifi.SoftApInfo
 import android.os.Build
 import androidx.annotation.RequiresApi
 import androidx.compose.runtime.Composable
@@ -24,6 +23,7 @@ import be.mygod.vpnhotspot.util.Services
 import be.mygod.vpnhotspot.util.UnblockCentral
 import be.mygod.vpnhotspot.util.toRegionalIndicatorFlagOrNull
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.emitAll
 import timber.log.Timber
 import java.util.Locale
 
@@ -34,30 +34,30 @@ internal data class SoftApRuntimeInfo(
 
 @RequiresApi(30)
 @Composable
-internal fun rememberSoftApRuntimeInfo(): State<SoftApRuntimeInfo?> {
+internal fun rememberSoftApRuntimeInfo(target: ApConfigurationTarget): State<SoftApRuntimeInfo?> {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
-    return produceState<SoftApRuntimeInfo?>(null, context, lifecycleOwner) {
+    return produceState<SoftApRuntimeInfo?>(null, context, lifecycleOwner, target) {
         var currentCapability: SoftApCapability? = null
-        var vendorData = ""
         fun update() {
             value = currentCapability?.let {
                 SoftApRuntimeInfo(
                     supportedChannels = softApSupportedChannels(context, it),
-                    advancedInfo = softApAdvancedInfo(context, it, vendorData),
+                    advancedInfo = softApAdvancedInfo(context, it),
                 )
             }
         }
-        fun updateVendorData(infos: List<SoftApInfo>) {
-            if (Build.VERSION.SDK_INT >= 35) {
-                vendorData = VendorData.serialize(infos.flatMap { it.vendorData })
-                update()
-            }
-        }
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            WifiApCommands.softApCallbackFlow(expensive = true).catch { e -> Timber.w(e) }.collect { event ->
+            val events = if (target == ApConfigurationTarget.Temporary && Build.VERSION.SDK_INT >= 33) {
+                WifiApCommands.localOnlyHotspotSoftApCallbackFlow(expensive = true).catch { e ->
+                    if (e is WifiApManager.SoftApCallbackUnavailableException) {
+                        if (e.cause == null) Timber.d(e) else Timber.w(e)
+                        emitAll(WifiApCommands.softApCallbackFlow(expensive = true))
+                    } else throw e
+                }
+            } else WifiApCommands.softApCallbackFlow(expensive = true)
+            events.catch { e -> Timber.w(e) }.collect { event ->
                 when (event) {
-                    is WifiApManager.Event.OnInfoChanged -> updateVendorData(event.info)
                     is WifiApManager.Event.OnCapabilityChanged -> {
                         currentCapability = event.capability
                         update()
@@ -69,7 +69,7 @@ internal fun rememberSoftApRuntimeInfo(): State<SoftApRuntimeInfo?> {
     }
 }
 
-private fun softApAdvancedInfo(context: Context, capability: SoftApCapability, vendorData: String): String {
+private fun softApAdvancedInfo(context: Context, capability: SoftApCapability): String {
     val lines = mutableListOf(
         context.getString(R.string.repeater_features) + softApSupportedFeatures(context, capability),
     )
@@ -84,7 +84,6 @@ private fun softApAdvancedInfo(context: Context, capability: SoftApCapability, v
         } ?: countryCode
         lines += context.getString(R.string.tethering_manage_wifi_country_code, label)
     }
-    if (vendorData.isNotEmpty()) lines += context.getString(R.string.tethering_manage_wifi_vendor_data, vendorData)
     return lines.joinToString("\n")
 }
 

@@ -20,22 +20,26 @@ import be.mygod.vpnhotspot.net.wifi.SoftApConfigurationCompat
 import be.mygod.vpnhotspot.net.wifi.WifiApManager
 import be.mygod.vpnhotspot.net.wifi.apInstanceIdentifierOrNull
 import be.mygod.vpnhotspot.root.WifiApCommands
+import be.mygod.vpnhotspot.ui.apconfiguration.VendorData
 import be.mygod.vpnhotspot.ui.apconfiguration.formatTimeoutMillis
 import kotlinx.coroutines.flow.catch
 import timber.log.Timber
 import java.text.NumberFormat
 import java.util.Locale
 
+internal enum class SoftApCallbackTarget { Tethered, LocalOnlyHotspot }
+
 @RequiresApi(30)
 @Composable
 internal fun rememberWifiSummaryApi30(
     baseError: AnnotatedString?,
     linkStyles: TextLinkStyles,
+    target: SoftApCallbackTarget = SoftApCallbackTarget.Tethered,
 ): State<AnnotatedString?> {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val locale = LocalConfiguration.current.locales[0]
-    return produceState(baseError, context, lifecycleOwner, locale, baseError, linkStyles) {
+    return produceState(baseError, context, lifecycleOwner, locale, baseError, linkStyles, target) {
         var wifiFailureReason: Int? = null
         var wifiNumClients: Int? = null
         var wifiInfo = emptyList<SoftApInfo>()
@@ -52,7 +56,9 @@ internal fun rememberWifiSummaryApi30(
             )
         }
         lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            WifiApCommands.softApCallbackFlow(expensive = true).catch { e -> Timber.w(e) }.collect { event ->
+            (if (target == SoftApCallbackTarget.LocalOnlyHotspot && Build.VERSION.SDK_INT >= 33) {
+                WifiApCommands.localOnlyHotspotSoftApCallbackFlow(expensive = true)
+            } else WifiApCommands.softApCallbackFlow(expensive = true)).catch { e -> Timber.w(e) }.collect { event ->
                 when (event) {
                     is WifiApManager.Event.OnStateChanged -> {
                         if (!WifiApManager.checkWifiApState(event.state)) return@collect
@@ -137,6 +143,12 @@ private fun softApInfoSummary(
             }?.let {
                 append(", MLD MAC ")
                 appendMacAddress(it.toString(), linkStyles)
+            }
+        }
+        if (Build.VERSION.SDK_INT >= 35) {
+            VendorData.serialize(infos.flatMap { it.vendorData }).takeIf { it.isNotEmpty() }?.let { data ->
+                if (length > 0) append('\n')
+                append(context.getString(R.string.tethering_manage_wifi_vendor_data, data))
             }
         }
     }
