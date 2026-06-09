@@ -5,6 +5,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.annotation.RequiresApi
 import androidx.collection.mutableScatterMapOf
+import be.mygod.librootkotlinx.NoShellException
 import be.mygod.librootkotlinx.ParcelableBoolean
 import be.mygod.librootkotlinx.RootCommand
 import be.mygod.librootkotlinx.RootCommandNoResult
@@ -123,11 +124,23 @@ object WifiApCommands {
             null
         } catch (e: CancellationException) {
             throw e
+        } catch (e: NoShellException) {
+            throw e
         } catch (e: WifiApManager.SoftApCallbackUnavailableException) {
             e
         } catch (e: Exception) {
             Timber.w(e)
             WifiApManager.SoftApCallbackUnavailableException(e)
+        }
+
+        suspend fun collectRoot(
+            flow: Flow<WifiApManager.Event>,
+            previousFailure: WifiApManager.SoftApCallbackUnavailableException,
+        ) = try {
+            collect(flow)?.apply { addSuppressed(previousFailure) }
+        } catch (e: NoShellException) {
+            e.addSuppressed(previousFailure)
+            throw e
         }
 
         fun hasExpensiveSubscribers() = synchronized(lock) { subscribers.any { _, expensive -> expensive } }
@@ -136,13 +149,11 @@ object WifiApCommands {
     private val softApCallbackRelay = SoftApCallbackRelay {
         var failure = collect(WifiApManager.softApCallbackFlow) ?: return@SoftApCallbackRelay
         if (Build.VERSION.SDK_INT >= 31) {
-            failure = (collect(softApCallbackBinderFlow) ?: return@SoftApCallbackRelay).apply {
-                addSuppressed(failure)
-            }
+            failure = collectRoot(softApCallbackBinderFlow, failure) ?: return@SoftApCallbackRelay
         }
-        if (hasExpensiveSubscribers()) failure = (collect(flow {
+        if (hasExpensiveSubscribers()) failure = (collectRoot(flow {
             RootManager.use { emitAll(it.flow(SoftApCallbackFlow())) }
-        }) ?: return@SoftApCallbackRelay).apply { addSuppressed(failure) }
+        }, failure) ?: return@SoftApCallbackRelay)
         throw failure
     }
     fun softApCallbackFlow(expensive: Boolean = false) = softApCallbackRelay.flow(expensive)
@@ -150,12 +161,10 @@ object WifiApCommands {
     @get:RequiresApi(33)
     private val localOnlyHotspotSoftApCallbackRelay = SoftApCallbackRelay {
         var failure = collect(WifiApManager.localOnlyHotspotSoftApCallbackFlow) ?: return@SoftApCallbackRelay
-        failure = (collect(localOnlyHotspotSoftApCallbackBinderFlow) ?: return@SoftApCallbackRelay).apply {
-            addSuppressed(failure)
-        }
-        if (hasExpensiveSubscribers()) failure = (collect(flow {
+        failure = collectRoot(localOnlyHotspotSoftApCallbackBinderFlow, failure) ?: return@SoftApCallbackRelay
+        if (hasExpensiveSubscribers()) failure = (collectRoot(flow {
             RootManager.use { emitAll(it.flow(LocalOnlyHotspotSoftApCallbackFlow())) }
-        }) ?: return@SoftApCallbackRelay).apply { addSuppressed(failure) }
+        }, failure) ?: return@SoftApCallbackRelay)
         throw failure
     }
     @RequiresApi(33)
@@ -226,6 +235,8 @@ object WifiApCommands {
                 if (registered) RootManager.use { it.execute(UnregisterSoftApCallback(callback)) }
             }
             throw e
+        } catch (e: NoShellException) {
+            throw e
         } catch (e: Exception) {
             throw WifiApManager.SoftApCallbackUnavailableException(e)
         }
@@ -274,6 +285,8 @@ object WifiApCommands {
                         it.execute(UnregisterLocalOnlyHotspotSoftApCallback(callback))
                     }
                 }
+                throw e
+            } catch (e: NoShellException) {
                 throw e
             } catch (e: Exception) {
                 throw WifiApManager.SoftApCallbackUnavailableException(e)

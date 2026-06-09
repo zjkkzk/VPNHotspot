@@ -68,6 +68,19 @@ Upstream sockets are bound to Android networks with `android_setsocknetwork`.
 Reply sockets use the daemon reply mark so responses route through Android's
 local-network path before VPN UID rules.
 
+NAT66 DNS traffic to the NAT66 gateway reuses the DNS runtime's TCP and UDP
+handlers. Host- or network-unreachable DNS TCP response writes are treated as
+downstream reachability churn and logged, matching direct DNS TCP handling,
+instead of surfacing as `nat66.tcp_connection` nonfatals.
+
+The selected Android network is external state owned by ConnectivityService and
+netd. If it disappears between session config publication and upstream socket
+setup, `android_setsocknetwork` can fail with `ENONET`. NAT66 logs that
+per-flow/per-association setup loss with the selected network and role, then
+drops the intercepted connection or datagram without emitting a structured
+nonfatal. No daemon-owned socket state is committed in that case, so normal
+session stop, replacement, process death, or Clean has no extra cleanup work.
+
 ## Routing Contract
 
 Routing owns packet interception. NAT66 owns only the listeners, proxy tasks,
@@ -120,16 +133,27 @@ context for accepted connections. The TCP runtime:
 - relays bytes bidirectionally, preserving TCP half-close semantics.
 
 Connection setup failures caused by the remote path are logged and consumed.
-Socket setup failures that indicate daemon or platform state problems are
-terminal for that connection task and reported through the normal daemon report
-path.
+When `android_setsocknetwork` reports `ENONET`, the selected upstream network
+handle has already disappeared; the connection is logged and dropped because no
+upstream socket state was committed. Other socket setup failures that indicate
+daemon or platform state problems are terminal for that connection task and
+reported with the selected network context through the daemon report path.
 
 TCP is connection-local. It does not publish separate NAT66 state after the
 connection task starts. A graceful EOF on one side shuts down only the write half
 of the opposite socket and the other direction keeps relaying until it also
-closes or an I/O error occurs. Reset, broken-pipe, timeout, and other connection
-errors end the connection task. The session runtime does not track completed TCP
-connections.
+closes or an I/O error occurs. Reset, broken-pipe, timeout, host-unreachable, and
+network-unreachable errors end only the connection task. The session runtime
+does not track completed TCP connections.
+
+TCP relay reports are attributed to the relay leg before they leave the
+connection task. Read, write, flush, and shutdown errors use separate contexts
+under `nat66.tcp_relay.inbound_to_outbound.*` or
+`nat66.tcp_relay.outbound_to_inbound.*` and include the MAC, client,
+destination, selected network, role, direction, operation, and relay stage.
+Expected connection-close and route-unreachable errors remain log-only;
+unexpected relay I/O errors become structured daemon nonfatals with that relay
+context preserved.
 
 TCP byte counters update during relay. NAT66 TCP also increments its sent packet
 counter once after a remote upstream socket is successfully opened; that counter
@@ -155,10 +179,24 @@ UDP counts one sent unit per upstream datagram and one received unit per
 upstream response datagram. NAT66 gateway DNS datagrams are counted by DNS, not
 by the `/nat66/udp` source.
 
+Creating a UDP association first selects an Android network, binds the upstream
+socket to that network, and connects the socket to the IPv6 destination. `ENONET`
+from network selection is treated the same as TCP setup loss. `EHOSTUNREACH` or
+`ENETUNREACH` from the connected UDP socket setup means the selected network
+accepted the socket but cannot route that destination, for example a fallback
+network without a usable IPv6 route. NAT66 logs the failure with MAC, client,
+destination, selected network, and role, then drops the datagram without creating
+an association. Other UDP setup/connect failures remain structured nonfatals.
+
 Each association has one task that owns upstream receives and downstream
 responses. The listener owns downstream receives and association creation. The
 association task reports activity back to the listener, and idle associations
 are cancelled after the NAT66 idle timeout.
+
+Reply socket reservations keep the pool aware of source/mark binds while an
+association may hold a cached reply socket. Association teardown releases the
+cached socket reference before releasing the reservation, so a replacement
+association cannot race a duplicate transparent bind for the same reply source.
 
 ICMP error translation for UDP is association-local and MAC-attributed. The
 association registers only while the connected upstream UDP socket is alive, and
@@ -202,9 +240,13 @@ The dispatcher owns:
 - UDP error registrations used by live UDP associations.
 
 A NAT66 session registers ICMP only after proving that downstream send support
-is available for its downstream interface and reply mark. Dropping the
-registration removes that downstream interface from ICMP dispatch. Dropping the
-session removes its Echo state.
+is available for its downstream interface and reply mark. If the transparent raw
+IPv6 bind probe fails with `EADDRNOTAVAIL`, kernels older than Linux 5.11.14
+and unparsable `uname.release` values are treated as expected legacy lack of
+support and do not emit a structured nonfatal. The session still continues
+without ICMP Echo interception. Dropping the registration removes that
+downstream interface from ICMP dispatch. Dropping the session removes its Echo
+state.
 
 ICMP Echo interception is optional. Routing installs the ICMP NFQUEUE rule only
 when the registration exists. Ordinary local control-plane ICMPv6, neighbour
@@ -285,7 +327,8 @@ NAT66 startup is best effort across these pieces:
 - RA task setup failure is nonfatal; existing NAT66 interception may continue,
   but clients may need other configuration to discover the gateway.
 - ICMP registration failure is nonfatal; NAT66 continues without ICMP Echo
-  interception.
+  interception. The known transparent raw IPv6 bind `EADDRNOTAVAIL` failure is
+  reported only when `uname.release` parses as Linux 5.11.14 or newer.
 - Unattributable ICMP NFQUEUE packets are dropped and reported as nonfatal
   background state.
 - ICMP error-queue setup failure is reported, but Echo and UDP may continue

@@ -8,8 +8,8 @@ use crate::{firewall::IptablesTarget, netlink, report};
 use vpnhotspotd::shared::downstream::DownstreamIpv4;
 use vpnhotspotd::shared::model::{
     mac_string, ClientDnsPorts, ClientIpv6NatPorts, Ipv6NatConfig, Ipv6NatPorts, SessionConfig,
-    SessionPorts, UpstreamConfig, UpstreamRole, DAEMON_INTERCEPT_FWMARK_MASK,
-    DAEMON_INTERCEPT_FWMARK_VALUE, DAEMON_TABLE, LOCAL_NETWORK_TABLE,
+    SessionPorts, UpstreamConfig, UpstreamRole, ANDROID_ROUTE_TABLE_LOCAL_NETWORK,
+    DAEMON_INTERCEPT_FWMARK_MASK, DAEMON_INTERCEPT_FWMARK_VALUE, DAEMON_TABLE,
 };
 use vpnhotspotd::shared::proto::daemon::MasqueradeMode;
 
@@ -199,7 +199,7 @@ impl Runtime {
                     destination: IpAddr::V6(ipv6_nat.gateway.first_address()),
                     prefix_len: ipv6_nat.gateway.network_length(),
                     interface: config.downstream.clone(),
-                    table: LOCAL_NETWORK_TABLE,
+                    table: ANDROID_ROUTE_TABLE_LOCAL_NETWORK,
                 })),
             );
             push_unique(
@@ -513,7 +513,7 @@ impl Runtime {
         protocol: &str,
         port: u16,
     ) -> [IptablesRule; 2] {
-        let base_args = [
+        let mut allow_args = [
             "-i".to_owned(),
             config.downstream.clone(),
             "-p".to_owned(),
@@ -522,8 +522,8 @@ impl Runtime {
             self.downstream_ipv4.address.to_string(),
             "--dport".to_owned(),
             port.to_string(),
-        ];
-        let mut allow_args = base_args.to_vec();
+        ]
+        .to_vec();
         allow_args.extend([
             "-m".to_owned(),
             "conntrack".to_owned(),
@@ -534,8 +534,11 @@ impl Runtime {
             "-j".to_owned(),
             "RETURN".to_owned(),
         ]);
-        let mut reject_args = base_args.to_vec();
-        reject_args.extend([
+        let reject_args = [
+            "-p".to_owned(),
+            protocol.to_owned(),
+            "--dport".to_owned(),
+            port.to_string(),
             "-j".to_owned(),
             "REJECT".to_owned(),
             "--reject-with".to_owned(),
@@ -544,7 +547,8 @@ impl Runtime {
             } else {
                 "icmp-port-unreachable".to_owned()
             },
-        ]);
+        ]
+        .to_vec();
         [
             IptablesRule::new(
                 IptablesTarget::Ipv4,

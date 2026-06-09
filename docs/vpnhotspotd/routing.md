@@ -60,7 +60,9 @@ path fails.
 Condition: the owned nat chain and PREROUTING jump are present for a started
 session with downstream IPv4. Per-MAC redirect rules are present per committed
 client MAC and protocol when DNS startup produced that MAC/protocol listener
-port and routing can also install the matching direct-port guard.
+port and routing can also install the matching direct-port guard. DNS listener
+ports are daemon-owned sockets bound to `0.0.0.0`; the downstream IPv4 address is
+owned by routing and appears only in packet matching and conntrack validation.
 
 External mutations:
 
@@ -69,16 +71,18 @@ External mutations:
 - `iptables -t nat -I vpnhotspot_dns_nat -i <downstream> -p tcp -m mac --mac-source <mac> -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-tcp-port-for-mac>`
 - `iptables -t nat -I vpnhotspot_dns_nat -i <downstream> -p udp -m mac --mac-source <mac> -d <downstream-ipv4> --dport 53 -j DNAT --to-destination :<dns-udp-port-for-mac>`
 - `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p tcp -d <downstream-ipv4> --dport <dns-tcp-port-for-mac> -m conntrack --ctorigdst <downstream-ipv4> --ctorigdstport 53 -j RETURN`
-- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p tcp -d <downstream-ipv4> --dport <dns-tcp-port-for-mac> -j REJECT --reject-with tcp-reset`
+- `iptables -t filter -I vpnhotspot_dns_input -p tcp --dport <dns-tcp-port-for-mac> -j REJECT --reject-with tcp-reset`
 - `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p udp -d <downstream-ipv4> --dport <dns-udp-port-for-mac> -m conntrack --ctorigdst <downstream-ipv4> --ctorigdstport 53 -j RETURN`
-- `iptables -t filter -I vpnhotspot_dns_input -i <downstream> -p udp -d <downstream-ipv4> --dport <dns-udp-port-for-mac> -j REJECT --reject-with icmp-port-unreachable`
+- `iptables -t filter -I vpnhotspot_dns_input -p udp --dport <dns-udp-port-for-mac> -j REJECT --reject-with icmp-port-unreachable`
 
 Effective order for a listener port is the conntrack original-destination
 `RETURN` before the direct-port `REJECT`. The guard makes the ephemeral listener
 port reachable only as the post-DNAT target of a packet originally addressed to
-the downstream gateway on port 53. If routing cannot install or validate the
-conntrack original-destination guard, it must omit that MAC/protocol DNS
-capability instead of exposing the listener port directly.
+the downstream gateway on port 53. Because listeners are wildcard-bound, the
+direct-port `REJECT` is intentionally not scoped to the downstream interface or
+gateway address. If routing cannot install or validate the conntrack
+original-destination guard, it must omit that MAC/protocol DNS capability
+instead of exposing the listener port directly.
 
 The guard lines above are the required effective order. Because iptables `-I`
 inserts at the head by default, implementation must either insert with explicit
@@ -261,7 +265,7 @@ least one TCP or UDP runtime capability.
 
 External mutations:
 
-- replace IPv6 unicast route in table 99:
+- replace IPv6 unicast route in table 97:
   `<nat66-prefix> dev <downstream> table local_network`
 - replace IPv6 address on the downstream:
   `<nat66-gateway>/<prefix-len> dev <downstream>`
@@ -287,9 +291,9 @@ Clean:
 - flush IPv6 routes from table 900.
 - reconstruct `<nat66-prefix>` and `<nat66-gateway>` for every current
   interface from the Clean prefix seed, then delete the gateway address and
-  table 99 route for each interface.
+  table 97 route for each interface.
 
-Clean never flushes table 99 because it is Android's shared `local_network`
+Clean never flushes table 97 because it is Android's shared `local_network`
 table.
 
 Before routing the first candidate NAT66 TCP/UDP listener ports, routing probes
@@ -652,7 +656,7 @@ For every current interface name:
 - reconstruct the deterministic NAT66 prefix from the Clean prefix seed and the
   interface name.
 - delete address `<nat66-gateway>/<prefix-len>` from that interface.
-- delete table 99 unicast route `<nat66-prefix> dev <interface>`.
+- delete table 97 unicast route `<nat66-prefix> dev <interface>`.
 
 Missing address or route is expected. For address deletion, this includes an
 interface that still exists but has no IPv6 address state. Other errors are
@@ -724,11 +728,11 @@ and tethering priorities were lower before Android 12.
 The daemon uses these table conventions:
 
 - table 900 is VPNHotspot's daemon table for NAT66 local interception;
-- table 99 is Android's shared `local_network` table;
+- table 97 is Android's shared `local_network` route table;
 - upstream interface tables use Android's `ifindex + 1000` convention.
 
 Table 900 may be flushed by Clean because it is reserved by VPNHotspot. Table
-99 must not be flushed; delete only reconstructed VPNHotspot NAT66 routes from
+97 must not be flushed; delete only reconstructed VPNHotspot NAT66 routes from
 it.
 
 ## Guardrails

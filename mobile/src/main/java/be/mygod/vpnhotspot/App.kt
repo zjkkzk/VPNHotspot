@@ -22,6 +22,7 @@ import androidx.annotation.Size
 import androidx.browser.customtabs.CustomTabColorSchemeParams
 import androidx.browser.customtabs.CustomTabsIntent
 import androidx.core.content.getSystemService
+import be.mygod.librootkotlinx.NoShellException
 import be.mygod.vpnhotspot.room.AppDatabase
 import be.mygod.vpnhotspot.root.RootManager
 import be.mygod.vpnhotspot.util.CrashlyticsKeyProvider
@@ -36,7 +37,6 @@ import com.google.firebase.analytics.ParametersBuilder
 import com.google.firebase.analytics.logEvent
 import com.google.firebase.crashlytics.FirebaseCrashlytics
 import com.google.firebase.provider.FirebaseInitProvider
-import com.topjohnwu.superuser.NoShellException
 import kotlinx.coroutines.DEBUG_PROPERTY_NAME
 import kotlinx.coroutines.DEBUG_PROPERTY_VALUE_ON
 import kotlinx.coroutines.GlobalScope
@@ -51,8 +51,13 @@ class App : Application() {
         lateinit var app: App
     }
 
-    override fun onCreate() {
-        super.onCreate()
+    init {
+        // overhead of debug mode is minimal: https://github.com/Kotlin/kotlinx.coroutines/blob/f528898/docs/debugging.md#debug-mode
+        System.setProperty(DEBUG_PROPERTY_NAME, DEBUG_PROPERTY_VALUE_ON)
+    }
+
+    override fun attachBaseContext(base: Context?) {
+        super.attachBaseContext(base)
         app = this
         deviceStorage = DeviceStorageApp(this)
         @Suppress("DEPRECATION")
@@ -61,8 +66,6 @@ class App : Application() {
         deviceStorage.moveDatabaseFrom(this, AppDatabase.DB_NAME)
         Services.init { this }
 
-        // overhead of debug mode is minimal: https://github.com/Kotlin/kotlinx.coroutines/blob/f528898/docs/debugging.md#debug-mode
-        System.setProperty(DEBUG_PROPERTY_NAME, DEBUG_PROPERTY_VALUE_ON)
         DynamiteModule::class.java.getDeclaredField("zzg").apply { isAccessible = true }.set(null, false)
         // call super.attachInfo get around ProviderInfo check
         FirebaseInitProvider::class.java.privateLookup().findSpecial(ContentProvider::class.java, "attachInfo",
@@ -111,6 +114,10 @@ class App : Application() {
         StrictMode.setVmPolicy(StrictMode.VmPolicy.Builder().apply {
             if (BuildConfig.DEBUG) detectAll() else detectFileUriExposure()
         }.penaltyListener(InPlaceExecutor) { Timber.w(it, "StrictMode VM policy violation") }.build())
+    }
+
+    override fun onCreate() {
+        super.onCreate()
         ServiceNotification.updateNotificationChannels()
     }
 
