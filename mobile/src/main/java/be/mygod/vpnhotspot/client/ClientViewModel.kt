@@ -243,7 +243,7 @@ class ClientViewModel : ViewModel(), DefaultLifecycleObserver {
                 clients[key] ?: Client(mac, key.first, type).also { clients[key] = it }
             }
         val repeater = repeater.value
-        val p2pInterface = if (repeater?.active == true) repeater.group.value?.`interface` else null
+        val p2pInterface = if (repeater?.active?.value == true) repeater.group.value?.`interface` else null
         val wifiAp = wifiAp
         val localOnlyHotspot = localOnlyHotspot
         p2pInterface?.let { p2pInterface ->
@@ -252,6 +252,7 @@ class ClientViewModel : ViewModel(), DefaultLifecycleObserver {
                 getClient(addr, p2pInterface, TetherType.WIFI_P2P).apply {
                     addSource(p2pInterface)
                     active = true
+                    if (Build.VERSION.SDK_INT >= 37) wifiP2pConnectionInfo = client.wifiP2pConnectionInfo
                     // WiFi mainline module might be backported to API 30
                     if (Build.VERSION.SDK_INT >= 30) try {
                         client.ipAddress
@@ -370,7 +371,7 @@ class ClientViewModel : ViewModel(), DefaultLifecycleObserver {
 
     private fun refreshP2p() {
         val repeater = repeater.value
-        p2p = (if (repeater?.active != true) null else repeater.group.value?.clientList) ?: emptyList()
+        p2p = (if (repeater?.active?.value == true) repeater.group.value?.clientList else null) ?: emptyList()
         populateClients()
     }
 
@@ -386,7 +387,7 @@ class ClientViewModel : ViewModel(), DefaultLifecycleObserver {
                 launch {
                     repeater.collectLatest { service ->
                         service ?: return@collectLatest
-                        merge(service.status, service.group).collect { refreshP2p() }
+                        merge(service.active, service.group).collect { refreshP2p() }
                     }
                 }
                 if (Build.VERSION.SDK_INT >= 30) {
