@@ -118,14 +118,16 @@ class ApConfigurationState(
         }
         p2pMode -> listOf(SecurityOption(R.string.wifi_security_wpa2_personal,
             SoftApConfiguration.SECURITY_TYPE_WPA2_PSK))
-        else -> listOf(
-            R.string.wifi_security_open,
-            R.string.wifi_security_wpa2_psk,
-            R.string.wifi_security_wpa3_sae_transition,
-            R.string.wifi_security_wpa3_sae,
-            R.string.wifi_security_wpa3_owe_transition,
-            R.string.wifi_security_wpa3_owe,
-        ).mapIndexed { index, label -> SecurityOption(label, index) }
+        else -> buildList {
+            add(R.string.wifi_security_open)
+            add(R.string.wifi_security_wpa2_psk)
+            add(R.string.wifi_security_wpa3_sae_transition)
+            add(R.string.wifi_security_wpa3_sae)
+            if (Build.VERSION.SDK_INT >= 33) {
+                add(R.string.wifi_security_wpa3_owe_transition)
+                add(R.string.wifi_security_wpa3_owe)
+            }
+        }.mapIndexed { index, label -> SecurityOption(label, index) }
     }
     private val channelOptions get() = currentChannelOptions(p2pMode)
     val bandwidthEntries = if (Build.VERSION.SDK_INT >= 33) {
@@ -444,8 +446,14 @@ class ApConfigurationState(
         } else decoded
     }
 
-    fun channelEntries(allowDisabled: Boolean = false) = if (allowDisabled) listOf(ChannelOption.Disabled) +
-            channelOptions else channelOptions
+    fun channelEntries(allowDisabled: Boolean = false): List<ChannelOption> {
+        val options = if (p2pMode && !useFramework && supplicantCapability?.aidlV3 != true) {
+            channelOptions.filterNot {
+                it.band == SoftApConfiguration.BAND_6GHZ && it.channel == 0
+            }
+        } else channelOptions
+        return if (allowDisabled) listOf(ChannelOption.Disabled) + options else options
+    }
     fun bssidEditable(macRandomization: Int) = !p2pMode && (Build.VERSION.SDK_INT < 31 ||
             macRandomization == SoftApConfigurationCompat.RANDOMIZATION_NONE)
     fun macAddressSummary(context: Context) = if (p2pMode) {
